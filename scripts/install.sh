@@ -17,6 +17,10 @@ HOST_DEST="/usr/local/bin/${HOST_BINARY}"
 DAEMON_DEST="/usr/local/bin/${DAEMON_BINARY}"
 HOST_MANIFEST_SRC="${REPO_ROOT}/scripts/com.webauthnproxy.host.json"
 SYSTEMD_UNIT_SRC="${REPO_ROOT}/scripts/webauthn-proxy-daemon.service"
+TRAY_BINARY="webauthn-proxy-tray"
+TRAY_DEST="/usr/local/bin/${TRAY_BINARY}"
+TRAY_SERVICE_SRC="${REPO_ROOT}/scripts/webauthn-proxy-tray.service"
+TRAY_SERVICE_DEST="${HOME}/.config/systemd/user/webauthn-proxy-tray.service"
 WEBAUTHN_DIR="/etc/webauthn-proxy"
 CREDENTIAL_DIR="${WEBAUTHN_DIR}/credentials"
 KEY_DIR="${WEBAUTHN_DIR}/keys"
@@ -181,7 +185,25 @@ systemctl enable webauthn-proxy-daemon
 echo "    Service enabled. Start with: systemctl start webauthn-proxy-daemon"
 
 # ---------------------------------------------------------------------------
-# 11. Instructions: set real extension ID
+# 11. Build and install system tray
+# ---------------------------------------------------------------------------
+echo "==> Building ${TRAY_BINARY} (release)..."
+cd "${REPO_ROOT}/systray"
+cargo build --release
+echo "    Build complete."
+
+install -m 0755 "${REPO_ROOT}/systray/target/release/${TRAY_BINARY}" "${TRAY_DEST}"
+echo "    ${TRAY_DEST}"
+
+echo "==> Installing tray user service..."
+mkdir -p "$(dirname "${TRAY_SERVICE_DEST}")"
+install -m 0644 "${TRAY_SERVICE_SRC}" "${TRAY_SERVICE_DEST}"
+systemctl --user daemon-reload
+systemctl --user enable webauthn-proxy-tray
+echo "    Start tray with: systemctl --user start webauthn-proxy-tray"
+
+# ---------------------------------------------------------------------------
+# 12. Instructions: set real extension ID
 # ---------------------------------------------------------------------------
 cat <<'INSTRUCTIONS'
 

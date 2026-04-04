@@ -1,0 +1,18 @@
+[package]
+name = "webauthn-proxy-tray"
+version = "0.1.0"
+edition = "2021"
+description = "System tray indicator for WebAuthn Proxy"
+license = "MIT"
+
+[[bin]]
+name = "webauthn-proxy-tray"
+path = "src/main.rs"
+
+[dependencies]
+ksni          = "0.2"
+log           = "0.4"
+env_logger    = "0.11"
+image         = "0.24"
+# tokio and zbus added when daemon status monitoring is implemented
+
