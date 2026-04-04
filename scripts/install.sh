@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — Build and install the WebAuthn Proxy native messaging host.
+# install.sh — Build and install the WebAuthn Proxy native host and daemon.
 #
 # Run as root (or with sudo) after loading the Chrome extension.
 # Usage: sudo ./scripts/install.sh
@@ -11,46 +11,131 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BINARY_NAME="webauthn-proxy-host"
-BINARY_DEST="/usr/local/bin/${BINARY_NAME}"
+HOST_BINARY="webauthn-proxy-host"
+DAEMON_BINARY="webauthn-proxy-daemon"
+HOST_DEST="/usr/local/bin/${HOST_BINARY}"
+DAEMON_DEST="/usr/local/bin/${DAEMON_BINARY}"
 HOST_MANIFEST_SRC="${REPO_ROOT}/scripts/com.webauthnproxy.host.json"
-CREDENTIAL_DIR="/etc/webauthn-proxy/credentials"
-KEY_DIR="/etc/webauthn-proxy/keys"
+SYSTEMD_UNIT_SRC="${REPO_ROOT}/scripts/webauthn-proxy-daemon.service"
+WEBAUTHN_DIR="/etc/webauthn-proxy"
+CREDENTIAL_DIR="${WEBAUTHN_DIR}/credentials"
+KEY_DIR="${WEBAUTHN_DIR}/keys"
+TRUSTED_HASHES="${WEBAUTHN_DIR}/trusted-binaries.json"
+BOOTSTRAP_KEY="${WEBAUTHN_DIR}/bootstrap.key"
 PAM_SERVICE="/etc/pam.d/webauthn-proxy"
+SYSTEMD_UNIT="/etc/systemd/system/webauthn-proxy-daemon.service"
+DAEMON_USER="webauthn-proxy"
 
 # Chrome and Chromium native messaging host directories (system-wide)
 CHROME_NMH_DIR="/etc/opt/chrome/native-messaging-hosts"
 CHROMIUM_NMH_DIR="/etc/chromium/native-messaging-hosts"
 
-# Per-user fallback (uncomment if you prefer user-level installation)
-# CHROME_NMH_DIR="${HOME}/.config/google-chrome/NativeMessagingHosts"
-# CHROMIUM_NMH_DIR="${HOME}/.config/chromium/NativeMessagingHosts"
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+die() { echo "FATAL: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-# 1. Build
+# 0. Preflight: Secure Boot + TPM2
 # ---------------------------------------------------------------------------
-echo "==> Building ${BINARY_NAME} (release)..."
+echo "==> Checking hardware prerequisites..."
+
+# Secure Boot
+if bootctl status 2>/dev/null | grep -q "Secure Boot: enabled"; then
+    echo "    Secure Boot: enabled ✓"
+else
+    echo "    WARNING: Secure Boot does not appear to be enabled."
+    echo "             TPM2 PCR binding provides weaker guarantees without Secure Boot."
+    echo "             Continuing — set ProtectKernelModules=yes in the service unit"
+    echo "             to limit exposure."
+fi
+
+# TPM2
+if [[ -c /dev/tpm0 && -c /dev/tpmrm0 ]]; then
+    echo "    TPM2: present ✓"
+else
+    echo "    WARNING: /dev/tpm0 or /dev/tpmrm0 not found."
+    echo "             The software fallback (plaintext keys on disk) will be used."
+    echo "             Do NOT use in production without a TPM2 chip."
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Create dedicated system user
+# ---------------------------------------------------------------------------
+echo "==> Ensuring system user '${DAEMON_USER}' exists..."
+if id "${DAEMON_USER}" &>/dev/null; then
+    echo "    User already exists."
+else
+    useradd --system --no-create-home --shell /usr/sbin/nologin "${DAEMON_USER}"
+    echo "    Created system user '${DAEMON_USER}'."
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Build native host
+# ---------------------------------------------------------------------------
+echo "==> Building ${HOST_BINARY} (release)..."
 cd "${REPO_ROOT}/native-host"
 cargo build --release
 echo "    Build complete."
 
 # ---------------------------------------------------------------------------
-# 2. Install binary
+# 3. Build daemon
 # ---------------------------------------------------------------------------
-echo "==> Installing binary to ${BINARY_DEST}..."
-install -m 0755 "target/release/${BINARY_NAME}" "${BINARY_DEST}"
-echo "    Installed."
+echo "==> Building ${DAEMON_BINARY} (release)..."
+cd "${REPO_ROOT}/daemon"
+cargo build --release
+echo "    Build complete."
 
 # ---------------------------------------------------------------------------
-# 3. Create credential and key directories
+# 4. Install binaries
 # ---------------------------------------------------------------------------
-echo "==> Creating /etc/webauthn-proxy/ directories..."
-install -d -m 0700 "${CREDENTIAL_DIR}"
-install -d -m 0700 "${KEY_DIR}"
+echo "==> Installing binaries..."
+install -m 0755 "${REPO_ROOT}/native-host/target/release/${HOST_BINARY}"   "${HOST_DEST}"
+install -m 0755 "${REPO_ROOT}/daemon/target/release/${DAEMON_BINARY}"       "${DAEMON_DEST}"
+echo "    ${HOST_DEST}"
+echo "    ${DAEMON_DEST}"
+
+# ---------------------------------------------------------------------------
+# 5. Create /etc/webauthn-proxy/ directory structure
+# ---------------------------------------------------------------------------
+echo "==> Creating ${WEBAUTHN_DIR}/ directories..."
+install -d -m 0700 -o "${DAEMON_USER}" "${WEBAUTHN_DIR}"
+install -d -m 0700 -o "${DAEMON_USER}" "${CREDENTIAL_DIR}"
+install -d -m 0700 -o "${DAEMON_USER}" "${KEY_DIR}"
 echo "    Directories ready."
 
 # ---------------------------------------------------------------------------
-# 4. Install PAM service configuration
+# 6. Generate bootstrap key (if not already present)
+# ---------------------------------------------------------------------------
+if [[ ! -f "${BOOTSTRAP_KEY}" ]]; then
+    echo "==> Generating bootstrap key at ${BOOTSTRAP_KEY}..."
+    openssl rand -hex 32 > "${BOOTSTRAP_KEY}"
+    chmod 0640 "${BOOTSTRAP_KEY}"
+    chown "root:${DAEMON_USER}" "${BOOTSTRAP_KEY}"
+    echo "    Bootstrap key generated."
+else
+    echo "    Bootstrap key already exists at ${BOOTSTRAP_KEY}, skipping."
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Hash both binaries and write trusted-binaries.json
+# ---------------------------------------------------------------------------
+echo "==> Writing trusted binary hashes to ${TRUSTED_HASHES}..."
+HOST_HASH="$(sha256sum "${HOST_DEST}" | awk '{print $1}')"
+DAEMON_HASH="$(sha256sum "${DAEMON_DEST}" | awk '{print $1}')"
+
+cat > "${TRUSTED_HASHES}" <<EOF
+[
+  { "path": "${HOST_DEST}",   "sha256": "${HOST_HASH}" },
+  { "path": "${DAEMON_DEST}", "sha256": "${DAEMON_HASH}" }
+]
+EOF
+chmod 0644 "${TRUSTED_HASHES}"
+echo "    native-host:  ${HOST_HASH}"
+echo "    daemon:       ${DAEMON_HASH}"
+
+# ---------------------------------------------------------------------------
+# 8. Install PAM service configuration
 # ---------------------------------------------------------------------------
 if [[ ! -f "${PAM_SERVICE}" ]]; then
     echo "==> Installing PAM service config at ${PAM_SERVICE}..."
@@ -73,22 +158,30 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Install native messaging host manifest
+# 9. Install native messaging host manifest
 # ---------------------------------------------------------------------------
 install_manifest() {
     local dest_dir="$1"
-    if [[ -d "${dest_dir}" || mkdir -p "${dest_dir}" ]]; then
-        install -m 0644 "${HOST_MANIFEST_SRC}" "${dest_dir}/com.webauthnproxy.host.json"
-        echo "    Manifest installed to ${dest_dir}/"
-    fi
+    mkdir -p "${dest_dir}"
+    install -m 0644 "${HOST_MANIFEST_SRC}" "${dest_dir}/com.webauthnproxy.host.json"
+    echo "    Manifest installed to ${dest_dir}/"
 }
 
 echo "==> Installing native messaging host manifests..."
-mkdir -p "${CHROME_NMH_DIR}"    && install_manifest "${CHROME_NMH_DIR}"
-mkdir -p "${CHROMIUM_NMH_DIR}"  && install_manifest "${CHROMIUM_NMH_DIR}"
+install_manifest "${CHROME_NMH_DIR}"
+install_manifest "${CHROMIUM_NMH_DIR}"
 
 # ---------------------------------------------------------------------------
-# 6. Instructions: set real extension ID
+# 10. Install and enable systemd service
+# ---------------------------------------------------------------------------
+echo "==> Installing systemd service unit..."
+install -m 0644 "${SYSTEMD_UNIT_SRC}" "${SYSTEMD_UNIT}"
+systemctl daemon-reload
+systemctl enable webauthn-proxy-daemon
+echo "    Service enabled. Start with: systemctl start webauthn-proxy-daemon"
+
+# ---------------------------------------------------------------------------
+# 11. Instructions: set real extension ID
 # ---------------------------------------------------------------------------
 cat <<'INSTRUCTIONS'
 
@@ -114,10 +207,13 @@ cat <<'INSTRUCTIONS'
          "s|EXTENSION_ID_PLACEHOLDER|${EXTENSION_ID}|g" "$f"
      done
 
-4. Reload the extension (click the refresh icon on chrome://extensions/).
+4. Start the daemon:  systemctl start webauthn-proxy-daemon
 
-The host will log to /tmp/webauthn-proxy-host.log — check there if the
-extension cannot connect.
+5. Reload the extension (click the refresh icon on chrome://extensions/).
+
+Logs:
+  Daemon:      journalctl -u webauthn-proxy-daemon  (or /tmp/webauthn-proxy-daemon.log)
+  Native host: /tmp/webauthn-proxy-host.log
 
 ============================================================
 INSTRUCTIONS

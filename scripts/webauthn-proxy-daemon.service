@@ -1,0 +1,30 @@
+[Unit]
+Description=WebAuthn Proxy Daemon
+Documentation=https://github.com/JamesFromFL/webauthn-proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/webauthn-proxy-daemon
+Restart=on-failure
+RestartSec=5s
+
+# Run as a dedicated unprivileged system user
+User=webauthn-proxy
+
+# Systemd hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectMemory=yes
+MemoryDenyWriteExecute=yes
+ReadOnlyPaths=/etc
+ReadWritePaths=/tmp
+PrivateTmp=yes
+RestrictRealtime=yes
+SystemCallFilter=@system-service
+
+# Allow the daemon to lock memory (needed for mlock on session tokens)
+LimitMEMLOCK=65536
+
+[Install]
+WantedBy=default.target
