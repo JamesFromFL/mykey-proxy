@@ -16,6 +16,7 @@ mod crypto;
 mod crypto_ops;
 mod dbus_interface;
 mod pam;
+mod pin_store;
 mod prereqs;
 mod protocol;
 mod registration;

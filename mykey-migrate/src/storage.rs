@@ -11,6 +11,31 @@ use serde::{Deserialize, Serialize};
 
 const BASE_DIR: &str = "/etc/mykey/secrets";
 
+fn internal_stage_dir_name() -> String {
+    format!(".staging-{}", uuid::Uuid::new_v4())
+}
+
+fn internal_backup_dir_name() -> String {
+    format!(".backup-{}", uuid::Uuid::new_v4())
+}
+
+fn is_internal_storage_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|name| name.starts_with(".staging-") || name.starts_with(".backup-"))
+        .unwrap_or(false)
+}
+
+fn remove_path(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+            .map_err(|e| format!("Cannot remove directory {}: {e}", path.display()))
+    } else {
+        std::fs::remove_file(path)
+            .map_err(|e| format!("Cannot remove file {}: {e}", path.display()))
+    }
+}
+
 fn save_collection_in(base_dir: &Path, c: &StoredCollection) -> Result<(), String> {
     let dir = base_dir.join(&c.id);
     std::fs::create_dir_all(&dir)
@@ -66,7 +91,14 @@ pub struct ActivatedStorage {
 
 impl StagedStorage {
     pub fn new() -> Result<Self, String> {
-        let path = PathBuf::from(format!("{}.staging-{}", BASE_DIR, uuid::Uuid::new_v4()));
+        let base = Path::new(BASE_DIR);
+        if !base.exists() {
+            return Err(format!(
+                "Base storage dir {} does not exist. Check that /etc/mykey/secrets/ is accessible.",
+                base.display()
+            ));
+        }
+        let path = base.join(internal_stage_dir_name());
         std::fs::create_dir_all(&path)
             .map_err(|e| format!("Cannot create staging dir {}: {e}", path.display()))?;
         Ok(Self { path })
@@ -90,30 +122,79 @@ impl StagedStorage {
 
     pub fn activate(self) -> Result<ActivatedStorage, String> {
         let base = Path::new(BASE_DIR);
-        let previous_base = if base.exists() {
-            let backup = PathBuf::from(format!("{}.backup-{}", BASE_DIR, uuid::Uuid::new_v4()));
-            std::fs::rename(base, &backup).map_err(|e| {
+        let backup = base.join(internal_backup_dir_name());
+        std::fs::create_dir_all(&backup)
+            .map_err(|e| format!("Cannot create backup dir {}: {e}", backup.display()))?;
+
+        let mut moved_existing: Vec<PathBuf> = Vec::new();
+        let existing_entries = std::fs::read_dir(base)
+            .map_err(|e| format!("Cannot list storage dir {}: {e}", base.display()))?;
+
+        for entry in existing_entries {
+            let entry = entry
+                .map_err(|e| format!("Cannot read storage entry in {}: {e}", base.display()))?;
+            let path = entry.path();
+            if path == self.path || path == backup || is_internal_storage_dir(&path) {
+                continue;
+            }
+            let backup_target = backup.join(entry.file_name());
+            std::fs::rename(&path, &backup_target).map_err(|e| {
                 format!(
                     "Cannot move existing storage {} to {}: {e}",
-                    base.display(),
-                    backup.display()
+                    path.display(),
+                    backup_target.display()
                 )
             })?;
-            Some(backup)
-        } else {
-            None
-        };
-
-        if let Err(e) = std::fs::rename(&self.path, base) {
-            if let Some(ref backup) = previous_base {
-                let _ = std::fs::rename(backup, base);
-            }
-            return Err(format!(
-                "Cannot activate staged storage {} -> {}: {e}",
-                self.path.display(),
-                base.display()
-            ));
+            moved_existing.push(backup_target);
         }
+
+        let staged_entries = std::fs::read_dir(&self.path)
+            .map_err(|e| format!("Cannot list staging dir {}: {e}", self.path.display()))?;
+
+        for entry in staged_entries {
+            let entry = entry.map_err(|e| {
+                format!("Cannot read staged entry in {}: {e}", self.path.display())
+            })?;
+            let staged_path = entry.path();
+            let active_path = base.join(entry.file_name());
+            if let Err(e) = std::fs::rename(&staged_path, &active_path) {
+                for path in std::fs::read_dir(base)
+                    .ok()
+                    .into_iter()
+                    .flat_map(|iter| iter.flatten())
+                    .map(|entry| entry.path())
+                    .filter(|path| !is_internal_storage_dir(path))
+                {
+                    let _ = remove_path(&path);
+                }
+                for backup_path in &moved_existing {
+                    let restore_target = base.join(
+                        backup_path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or_default(),
+                    );
+                    let _ = std::fs::rename(backup_path, restore_target);
+                }
+                let _ = std::fs::remove_dir_all(&backup);
+                let _ = std::fs::remove_dir_all(&self.path);
+                return Err(format!(
+                    "Cannot activate staged storage {} -> {}: {e}",
+                    staged_path.display(),
+                    active_path.display()
+                ));
+            }
+        }
+
+        std::fs::remove_dir(&self.path)
+            .map_err(|e| format!("Cannot remove empty staging dir {}: {e}", self.path.display()))?;
+
+        let previous_base = if moved_existing.is_empty() {
+            let _ = std::fs::remove_dir(&backup);
+            None
+        } else {
+            Some(backup)
+        };
 
         Ok(ActivatedStorage { previous_base })
     }
@@ -135,15 +216,46 @@ impl ActivatedStorage {
     pub fn rollback(self) -> Result<(), String> {
         let base = Path::new(BASE_DIR);
         if base.exists() {
-            std::fs::remove_dir_all(base)
-                .map_err(|e| format!("Cannot remove active storage {}: {e}", base.display()))?;
+            for entry in std::fs::read_dir(base)
+                .map_err(|e| format!("Cannot list active storage {}: {e}", base.display()))?
+            {
+                let entry = entry.map_err(|e| {
+                    format!("Cannot read active storage entry in {}: {e}", base.display())
+                })?;
+                let path = entry.path();
+                if self.previous_base.as_ref() == Some(&path) || is_internal_storage_dir(&path) {
+                    continue;
+                }
+                remove_path(&path)?;
+            }
         }
         if let Some(previous_base) = self.previous_base {
-            std::fs::rename(&previous_base, base).map_err(|e| {
+            let entries = std::fs::read_dir(&previous_base).map_err(|e| {
                 format!(
-                    "Cannot restore previous storage {} -> {}: {e}",
-                    previous_base.display(),
-                    base.display()
+                    "Cannot list previous storage backup {}: {e}",
+                    previous_base.display()
+                )
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    format!(
+                        "Cannot read previous storage backup entry in {}: {e}",
+                        previous_base.display()
+                    )
+                })?;
+                let restore_target = base.join(entry.file_name());
+                std::fs::rename(entry.path(), &restore_target).map_err(|e| {
+                    format!(
+                        "Cannot restore previous storage {} -> {}: {e}",
+                        previous_base.display(),
+                        restore_target.display()
+                    )
+                })?;
+            }
+            std::fs::remove_dir(&previous_base).map_err(|e| {
+                format!(
+                    "Cannot remove previous storage backup {}: {e}",
+                    previous_base.display()
                 )
             })?;
         }
@@ -163,6 +275,9 @@ pub fn load_collections() -> Vec<StoredCollection> {
         Err(_) => return cols,
     };
     for entry in entries.flatten() {
+        if is_internal_storage_dir(&entry.path()) {
+            continue;
+        }
         let col_json = entry.path().join("collection.json");
         if let Ok(data) = std::fs::read(&col_json) {
             if let Ok(col) = serde_json::from_slice::<StoredCollection>(&data) {

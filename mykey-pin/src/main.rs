@@ -7,7 +7,6 @@
 //   mykey-pin status   Show PIN and lockout status
 
 mod daemon_client;
-mod pin;
 
 use zeroize::Zeroizing;
 
@@ -19,8 +18,8 @@ async fn main() {
     match args.get(1).map(|s| s.as_str()) {
         Some("set") => run_set().await,
         Some("change") => run_change().await,
-        Some("reset") => run_reset(),
-        Some("status") => run_status(),
+        Some("reset") => run_reset().await,
+        Some("status") => run_status().await,
         _ => print_usage(),
     }
 }
@@ -37,14 +36,29 @@ fn print_usage() {
 // ---------------------------------------------------------------------------
 
 async fn run_set() {
-    // If a PIN is already enrolled, verify it before allowing a change.
-    if pin::pin_is_set() {
-        if !run_verify_current("Current MyKey PIN: ").await {
-            eprintln!("Current PIN verification failed.");
+    let uid = current_uid();
+    let client = connect_client().await;
+    let status = match client.pin_status(uid).await {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!("Could not read MyKey PIN status: {e}");
+            client.disconnect().await;
             std::process::exit(1);
         }
+    };
+
+    if status.is_set {
+        set_existing_pin(&client, uid).await;
+    } else {
+        require_strong_auth(
+            &client,
+            "First-time PIN enrollment requires verifying your Linux password or fingerprint.",
+        )
+        .await;
+        enroll_new_pin(&client, uid).await;
     }
-    set_new_pin().await;
+
+    client.disconnect().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -52,113 +66,125 @@ async fn run_set() {
 // ---------------------------------------------------------------------------
 
 async fn run_change() {
-    if !pin::pin_is_set() {
+    let uid = current_uid();
+    let client = connect_client().await;
+    let status = match client.pin_status(uid).await {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!("Could not read MyKey PIN status: {e}");
+            client.disconnect().await;
+            std::process::exit(1);
+        }
+    };
+
+    if !status.is_set {
         eprintln!("No MyKey PIN is set. Use 'mykey-pin set' first.");
+        client.disconnect().await;
         std::process::exit(1);
     }
-    if !run_verify_current("Current MyKey PIN: ").await {
-        eprintln!("Current PIN verification failed.");
-        std::process::exit(1);
-    }
-    set_new_pin().await;
+
+    set_existing_pin(&client, uid).await;
+    client.disconnect().await;
 }
 
 // ---------------------------------------------------------------------------
 // reset
 // ---------------------------------------------------------------------------
 
-fn run_reset() {
-    println!("Resetting PIN requires your Linux password.");
-    // Use sudo to remove the PIN file; this naturally prompts for the Linux
-    // password and confirms the user's identity before deleting root-owned data.
-    let status = std::process::Command::new("sudo")
-        .args(["rm", "-f", pin::PIN_FILE])
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to run sudo: {e}");
-            std::process::exit(1);
-        });
+async fn run_reset() {
+    let uid = current_uid();
+    let client = connect_client().await;
+    require_strong_auth(
+        &client,
+        "Resetting PIN requires verifying your Linux password or fingerprint.",
+    )
+    .await;
 
-    if status.success() {
-        pin::record_success();
-        println!("✓ MyKey PIN reset. Run mykey-pin set to create a new PIN.");
-    } else {
-        eprintln!("Authentication failed.");
+    if let Err(e) = client.pin_reset(uid).await {
+        client.disconnect().await;
+        eprintln!("Failed to reset MyKey PIN: {e}");
         std::process::exit(1);
     }
+    client.disconnect().await;
+    println!("✓ MyKey PIN reset. Run mykey-pin set to create a new PIN.");
 }
 
 // ---------------------------------------------------------------------------
 // status
 // ---------------------------------------------------------------------------
 
-fn run_status() {
-    let set = pin::pin_is_set();
-    let locked = pin::is_locked_out();
+async fn run_status() {
+    let uid = current_uid();
+    let client = connect_client().await;
+    let status = match client.pin_status(uid).await {
+        Ok(status) => status,
+        Err(e) => {
+            client.disconnect().await;
+            eprintln!("Could not read MyKey PIN status: {e}");
+            std::process::exit(1);
+        }
+    };
+    client.disconnect().await;
 
     println!("MyKey PIN status:");
-    println!("  PIN set:    {}", if set { "yes" } else { "no" });
-    match locked {
-        Some(secs) => println!("  Locked out: yes ({} seconds remaining)", secs),
-        None => println!("  Locked out: no"),
+    println!("  PIN set:    {}", if status.is_set { "yes" } else { "no" });
+    if status.cooldown_remaining_secs > 0 {
+        println!(
+            "  Locked out: yes ({} seconds remaining)",
+            status.cooldown_remaining_secs
+        );
+    } else {
+        println!("  Locked out: no");
     }
+    println!("  Failed attempts: {}", status.failed_sessions);
 }
 
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Prompt for the current PIN and verify it against the TPM2-sealed hash.
-///
-/// Returns `true` if the PIN matches, `false` otherwise.
-async fn run_verify_current(prompt: &str) -> bool {
-    let entered = match prompt_pin(prompt) {
-        Some(p) => p,
-        None => return false,
-    };
-
-    let sealed = match std::fs::read(pin::PIN_FILE) {
-        Ok(data) if !data.is_empty() => data,
-        _ => {
-            eprintln!("Failed to read MyKey PIN data.");
-            return false;
-        }
-    };
-
-    let client = match daemon_client::DaemonClient::connect().await {
-        Ok(c) => c,
+async fn connect_client() -> daemon_client::DaemonClient {
+    match daemon_client::DaemonClient::connect().await {
+        Ok(client) => client,
         Err(e) => {
             eprintln!("Could not connect to mykey-daemon: {e}");
-            return false;
+            std::process::exit(1);
         }
-    };
-
-    let unsealed = match client.unseal_secret(&sealed).await {
-        Ok(data) => {
-            client.disconnect().await;
-            data
-        }
-        Err(e) => {
-            client.disconnect().await;
-            eprintln!("Daemon unseal error: {e}");
-            return false;
-        }
-    };
-
-    pin::hash_pin(&entered) == unsealed
+    }
 }
 
-/// Prompt for a new PIN twice, confirm they match, seal and store it.
-async fn set_new_pin() {
+async fn require_strong_auth(
+    client: &daemon_client::DaemonClient,
+    intro: &str,
+) {
+    println!("{intro}");
+    match client.confirm_user_presence().await {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("Authentication failed.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Could not verify your identity: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn current_uid() -> u32 {
+    unsafe { libc::geteuid() as u32 }
+}
+
+async fn enroll_new_pin(client: &daemon_client::DaemonClient, uid: u32) {
     let new_pin = match prompt_pin("Enter new MyKey PIN: ") {
-        Some(p) => p,
+        Some(pin) => pin,
         None => {
             eprintln!("Failed to read PIN.");
             std::process::exit(1);
         }
     };
     let confirm = match prompt_pin("Confirm new MyKey PIN: ") {
-        Some(p) => p,
+        Some(pin) => pin,
         None => {
             eprintln!("Failed to read PIN confirmation.");
             std::process::exit(1);
@@ -170,44 +196,61 @@ async fn set_new_pin() {
         std::process::exit(1);
     }
 
-    let hash = Zeroizing::new(pin::hash_pin(&new_pin));
+    if let Err(e) = client.pin_enroll(uid, new_pin.as_bytes()).await {
+        eprintln!("Failed to enroll MyKey PIN: {e}");
+        std::process::exit(1);
+    }
 
-    let client = match daemon_client::DaemonClient::connect().await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Could not connect to mykey-daemon: {e}");
+    println!("✓ MyKey PIN set successfully.");
+}
+
+async fn set_existing_pin(client: &daemon_client::DaemonClient, uid: u32) {
+    let current_pin = match prompt_pin("Current MyKey PIN: ") {
+        Some(pin) => pin,
+        None => {
+            eprintln!("Failed to read current PIN.");
+            std::process::exit(1);
+        }
+    };
+    let new_pin = match prompt_pin("Enter new MyKey PIN: ") {
+        Some(pin) => pin,
+        None => {
+            eprintln!("Failed to read PIN.");
+            std::process::exit(1);
+        }
+    };
+    let confirm = match prompt_pin("Confirm new MyKey PIN: ") {
+        Some(pin) => pin,
+        None => {
+            eprintln!("Failed to read PIN confirmation.");
             std::process::exit(1);
         }
     };
 
-    let sealed = match client.seal_secret(&hash).await {
-        Ok(blob) => {
-            client.disconnect().await;
-            blob
-        }
-        Err(e) => {
-            client.disconnect().await;
-            eprintln!("Daemon seal error: {e}");
+    if new_pin != confirm {
+        eprintln!("PINs do not match.");
+        std::process::exit(1);
+    }
+
+    match client
+        .pin_change(uid, current_pin.as_bytes(), new_pin.as_bytes())
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("Current PIN verification failed.");
             std::process::exit(1);
         }
-    };
-
-    // Ensure the directory exists (requires appropriate filesystem permissions).
-    if let Err(e) = std::fs::create_dir_all(pin::PIN_DIR) {
-        eprintln!("Could not create {}: {e}", pin::PIN_DIR);
-        std::process::exit(1);
+        Err(e) => {
+            eprintln!("Failed to change MyKey PIN: {e}");
+            std::process::exit(1);
+        }
     }
 
-    if let Err(e) = std::fs::write(pin::PIN_FILE, &sealed) {
-        eprintln!("Could not write PIN file: {e}");
-        std::process::exit(1);
-    }
-
-    pin::record_success();
     println!("✓ MyKey PIN set successfully.");
 }
 
 /// Prompt for a PIN with no terminal echo.  Returns `None` on I/O error.
-fn prompt_pin(prompt: &str) -> Option<String> {
-    rpassword::prompt_password(prompt).ok()
+fn prompt_pin(prompt: &str) -> Option<Zeroizing<String>> {
+    rpassword::prompt_password(prompt).ok().map(Zeroizing::new)
 }

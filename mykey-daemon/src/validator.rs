@@ -3,6 +3,8 @@
 // All verification failures are logged with [validator] prefix including the
 // specific reason, to aid incident investigation without leaking secrets.
 
+use std::path::Path;
+
 use hmac::{Hmac, Mac};
 use log::{debug, warn};
 use sha2::{Digest, Sha256};
@@ -143,32 +145,56 @@ fn is_valid_browser_exe(path: &str) -> bool {
 
 /// Return true if the path/name belongs to a trusted MyKey binary.
 ///
-/// Matched case-insensitively. Kept separate from `is_valid_browser_exe` —
-/// these callers have different ancestry characteristics (systemd or shell
-/// parents) and must not be conflated with browser processes.
-fn is_valid_mykey_exe(path: &str) -> bool {
-    let lower = path.to_lowercase();
-    lower.contains("mykey-secrets")
-        || lower.contains("mykey-migrate")
-        || lower.contains("mykey-manager")
+/// Matching is done against the exact executable basename (argv[0] or
+/// `/proc/{pid}/exe` basename), not by substring. Kept separate from
+/// `is_valid_browser_exe` — these callers have different ancestry
+/// characteristics (systemd or shell parents) and must not be conflated with
+/// browser processes.
+const TRUSTED_MYKEY_BINARIES: &[&str] = &[
+    "mykey-host",
+    "mykey-secrets",
+    "mykey-migrate",
+    "mykey-manager",
+    "mykey-pin",
+    "mykey-pin-auth",
+];
+
+fn is_valid_mykey_program(program: &str) -> bool {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program);
+    TRUSTED_MYKEY_BINARIES.iter().any(|trusted| *trusted == name)
 }
 
-/// Verify that `pid` is a trusted MyKey binary.
+fn canonical_mykey_program_name(program: &str) -> Option<&'static str> {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program);
+    TRUSTED_MYKEY_BINARIES.iter().copied().find(|trusted| *trusted == name)
+}
+
+fn cmdline_program(cmdline: &[u8]) -> Option<&str> {
+    let argv0 = cmdline.split(|b| *b == 0).next()?;
+    if argv0.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(argv0).ok()
+}
+
+/// Identify the trusted MyKey program for `pid`, if any.
 ///
-/// Unlike [`verify_caller_process`], no ancestry check is performed — the
-/// parent of `mykey-secrets` is systemd and the parent of `mykey-migrate` is
-/// typically a shell; neither will match a meaningful allow-list.
-///
-/// Returns true if either `/proc/{pid}/exe` or `/proc/{pid}/cmdline` matches
-/// a known MyKey binary name.
-pub fn verify_mykey_caller(pid: u32) -> bool {
+/// Returns the canonical trusted basename such as `mykey-pin` or
+/// `mykey-manager` if the process matches a trusted MyKey binary.
+pub fn trusted_mykey_program(pid: u32) -> Option<&'static str> {
     // Check exe symlink first.
     match std::fs::read_link(format!("/proc/{pid}/exe")) {
         Ok(exe) => {
             let s = exe.to_string_lossy();
-            if is_valid_mykey_exe(&s) {
+            if let Some(name) = canonical_mykey_program_name(&s) {
                 debug!("[validator] pid={pid} exe={s} — recognised MyKey binary");
-                return true;
+                return Some(name);
             }
             debug!("[validator] pid={pid} exe={s} — not a recognised MyKey binary, checking cmdline");
         }
@@ -183,21 +209,26 @@ pub fn verify_mykey_caller(pid: u32) -> bool {
     // Fall back to cmdline.
     match std::fs::read(format!("/proc/{pid}/cmdline")) {
         Ok(cmdline) => {
-            let s = String::from_utf8_lossy(&cmdline);
-            if is_valid_mykey_exe(&s) {
-                debug!("[validator] pid={pid} cmdline contains MyKey binary identifier");
-                true
-            } else {
-                warn!(
-                    "[validator] pid={pid} cmdline does not contain MyKey binary identifier: {}",
-                    &s[..s.len().min(200)]
-                );
-                false
+            let preview = String::from_utf8_lossy(&cmdline);
+            match cmdline_program(&cmdline) {
+                Some(program) if is_valid_mykey_program(program) => {
+                    let name = canonical_mykey_program_name(program)
+                        .expect("trusted MyKey cmdline program should canonicalize");
+                    debug!("[validator] pid={pid} cmdline argv0={program} — recognised MyKey binary");
+                    Some(name)
+                }
+                _ => {
+                    warn!(
+                        "[validator] pid={pid} cmdline argv0 is not a recognised MyKey binary: {}",
+                        &preview[..preview.len().min(200)]
+                    );
+                    None
+                }
             }
         }
         Err(e) => {
             warn!("[validator] pid={pid} cannot read cmdline: {e}");
-            false
+            None
         }
     }
 }

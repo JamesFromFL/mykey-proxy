@@ -493,6 +493,7 @@ pub fn read_all_secrets() -> Result<Vec<MigratedItem>, String> {
         .map_err(|e| format!("OpenSession failed: {e}"))?;
 
     let col_paths = get_object_paths_prop(&conn, SS_PATH, SS_IFACE, "Collections")?;
+    let mut ready_col_paths = Vec::new();
     let mut items = Vec::new();
     let mut errors = Vec::new();
 
@@ -501,6 +502,23 @@ pub fn read_all_secrets() -> Result<Vec<MigratedItem>, String> {
         if col_str.ends_with("/session") {
             continue;
         }
+
+        let ready_path = match ensure_unlocked_col(&conn, col_path.clone()) {
+            Ok(path) => path,
+            Err(e) => {
+                let label = collection_label(&conn, col_str)
+                    .unwrap_or_else(|| col_str.to_string());
+                errors.push(format!(
+                    "Cannot unlock source collection '{label}': {e}"
+                ));
+                continue;
+            }
+        };
+        ready_col_paths.push(ready_path);
+    }
+
+    for col_path in unique_paths(ready_col_paths) {
+        let col_str = col_path.as_str();
 
         let col_label = match get_string_prop(&conn, col_str, COL_IFACE, "Label") {
             Ok(l) => l,

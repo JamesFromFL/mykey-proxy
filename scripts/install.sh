@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install.sh — MyKey full installer
-# Handles: Secure Boot setup, TPM verification, build, install, extension setup, health check
+# Handles: prerequisite verification, build, install, extension setup, and health check
 # Run as normal user: ./scripts/install.sh (will prompt for sudo when needed)
 
 if [[ $EUID -eq 0 ]]; then
@@ -29,6 +29,30 @@ confirm() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 FAILED=0
+PRECHECK_ERRORS=()
+
+requirement_fail() {
+    fail "$*"
+    PRECHECK_ERRORS+=("$*")
+}
+
+enforce_prechecks() {
+    if [[ ${#PRECHECK_ERRORS[@]} -eq 0 ]]; then
+        return
+    fi
+
+    echo ""
+    echo "  MyKey cannot be installed on this system until all required security"
+    echo "  prerequisites are met. This is intentional and part of MyKey's"
+    echo "  security design."
+    echo ""
+    echo "  Failed requirement(s):"
+    for err in "${PRECHECK_ERRORS[@]}"; do
+        echo "    - ${err}"
+    done
+    echo ""
+    die "Resolve the requirement(s) above and run ./scripts/install.sh again."
+}
 
 # ── Cargo discovery ───────────────────────────────────────────────────────────
 find_cargo() {
@@ -171,171 +195,15 @@ case "${SB_STATE}" in
         ok "Secure Boot is enabled"
         ;;
     setup_mode)
-        warn "Secure Boot is in Setup Mode — keys can be enrolled"
+        requirement_fail "Secure Boot is in Setup Mode. Full Secure Boot enforcement is required."
         ;;
     disabled)
-        warn "Secure Boot is disabled"
+        requirement_fail "Secure Boot is disabled."
         ;;
-    unknown)
-        warn "Could not determine Secure Boot state"
+    *)
+        requirement_fail "Secure Boot state could not be determined."
         ;;
 esac
-
-# Check if our binaries are already signed
-ALREADY_SIGNED=0
-if command -v sbctl &>/dev/null; then
-    if sbctl list-files 2>/dev/null | grep -q "mykey"; then
-        ok "MyKey binaries already enrolled in sbctl"
-        ALREADY_SIGNED=1
-    fi
-fi
-
-# Check if mokutil is managing things
-USING_MOK=0
-if command -v mokutil &>/dev/null && ! command -v sbctl &>/dev/null; then
-    warn "mokutil detected — assuming user manages Secure Boot manually"
-    USING_MOK=1
-fi
-
-if [[ "${SB_STATE}" == "enabled" && "${ALREADY_SIGNED}" -eq 1 ]]; then
-    ok "Secure Boot fully configured — skipping setup"
-
-elif [[ "${USING_MOK}" -eq 1 ]]; then
-    echo ""
-    echo "  ────────────────────────────────────────────────────────"
-    echo "  mokutil detected — you are managing Secure Boot manually."
-    echo ""
-    echo "  This installer will not attempt to sign files with your"
-    echo "  MOK keys. After installation completes you MUST sign"
-    echo "  the following files with your own keys or the proxy"
-    echo "  daemon will refuse to start:"
-    echo ""
-    echo "    /usr/local/bin/mykey-host"
-    echo "    /usr/local/bin/mykey-daemon"
-    echo "    /usr/local/bin/mykey-tray"
-    echo ""
-    echo "  Sign them with sbsign, pesign, or your preferred tool."
-    echo "  Example with sbsign:"
-    echo "    sudo sbsign --key /path/to/MOK.key --cert /path/to/MOK.crt \\"
-    echo "      --output /usr/local/bin/mykey-daemon \\"
-    echo "      /usr/local/bin/mykey-daemon"
-    echo ""
-    echo "  The proxy will not run without Secure Boot active and"
-    echo "  all binaries signed."
-    echo "  ────────────────────────────────────────────────────────"
-    echo ""
-    warn "Continuing installation — manual signing required before use"
-
-elif [[ "${SB_STATE}" == "disabled" && "${ALREADY_SIGNED}" -eq 0 ]]; then
-    echo ""
-    echo "  Secure Boot is not enabled on this system."
-    echo "  MyKey works best with Secure Boot enabled as it"
-    echo "  provides hardware-level protection for your authentication keys."
-    echo ""
-    if confirm "Would you like this script to guide you through Secure Boot setup?"; then
-
-        echo ""
-        echo "════════════════════════════════════════════════════════════"
-        echo ""
-        echo "  DISCLAIMER — PLEASE READ CAREFULLY"
-        echo ""
-        echo "  Secure Boot setup modifies your system firmware key database."
-        echo "  Incorrect configuration can prevent your system from booting."
-        echo ""
-        echo "  By proceeding you acknowledge:"
-        echo ""
-        echo "  - I am not responsible for any issues, data loss, or"
-        echo "    system failures that may result from this script."
-        echo ""
-        echo "  - It is strongly recommended that you research and"
-        echo "    understand Secure Boot before allowing any script"
-        echo "    to configure it on your behalf."
-        echo ""
-        echo "  - You should have a recovery method available before"
-        echo "    proceeding (live USB, backup bootloader, etc.)"
-        echo ""
-        echo "  - This script will enroll new signing keys into your"
-        echo "    firmware. This cannot be easily undone without"
-        echo "    entering BIOS and clearing platform keys."
-        echo ""
-        echo "════════════════════════════════════════════════════════════"
-        echo ""
-        echo "  To confirm you have read and understood the above,"
-        echo "  type the following exactly and press Enter:"
-        echo ""
-        echo '  Yes. I understand and agree. Continue with script secure-boot setup.'
-        echo ""
-        read -rp "  Your response: " SB_CONSENT
-        echo ""
-
-        if [[ "${SB_CONSENT}" != "Yes. I understand and agree. Continue with script secure-boot setup." ]]; then
-            warn "Consent not confirmed — skipping Secure Boot setup"
-            warn "You can set up Secure Boot manually and re-run this script"
-            SB_STATE="skip"
-        else
-            ok "Consent confirmed — proceeding with Secure Boot setup"
-
-            if ! command -v sbctl &>/dev/null; then
-                info "Installing sbctl..."
-                install_package sbctl
-            fi
-
-            SB_STATUS="$(sbctl status 2>/dev/null || true)"
-
-            if echo "${SB_STATUS}" | grep -q "Setup Mode.*Enabled"; then
-                ok "System is in Setup Mode — ready to enroll keys"
-
-                echo ""
-                info "Step 1: Generate Secure Boot signing keys"
-                if confirm "Generate new Secure Boot keys now?"; then
-                    sudo sbctl create-keys
-                    ok "Keys generated"
-                else
-                    die "Cannot continue without Secure Boot keys"
-                fi
-
-                echo ""
-                info "Step 2: Enroll keys into firmware"
-                echo ""
-                warn "Before enrolling keys, consider: if your hardware requires Microsoft's"
-                warn "UEFI keys (common on dual-boot systems, some laptops, or if you plan to"
-                warn "install Windows), you should include them."
-                echo ""
-                read -rp "Include Microsoft keys? (recommended for most hardware) [Y/n]: " ms_keys
-                if [[ "${ms_keys,,}" != "n" ]]; then
-                    sudo sbctl enroll-keys --microsoft
-                else
-                    sudo sbctl enroll-keys
-                fi
-
-            else
-                echo ""
-                echo "  ────────────────────────────────────────────────────"
-                echo "  Your system is not in Secure Boot Setup Mode."
-                echo ""
-                echo "  To enable Secure Boot setup you need to:"
-                echo "  1. Reboot your machine"
-                echo "  2. Enter BIOS/UEFI firmware (usually F2, F12, DEL,"
-                echo "     or ESC during boot — check your motherboard manual)"
-                echo "  3. Find the Secure Boot settings"
-                echo "  4. Clear existing Platform Keys or enable Setup Mode"
-                echo "  5. Save and reboot"
-                echo "  6. Run this installer again"
-                echo ""
-                echo "  WARNING: Clearing Platform Keys will disable Secure Boot"
-                echo "  temporarily until new keys are enrolled. This is normal"
-                echo "  and expected during the setup process."
-                echo "  ────────────────────────────────────────────────────"
-                echo ""
-                warn "Secure Boot setup requires BIOS intervention — cannot continue with Secure Boot"
-                warn "Continuing installation without Secure Boot — TPM key protection will be weaker"
-            fi
-        fi
-    else
-        warn "Skipping Secure Boot setup — continuing without it"
-        warn "TPM key sealing will provide less protection without Secure Boot"
-    fi
-fi
 
 # ════════════════════════════════════════════════════════════════════════════
 # PHASE 2 — TPM2
@@ -356,31 +224,10 @@ if [[ -c /dev/tpm0 && -c /dev/tpmrm0 ]]; then
     if tpm2_getcap properties-fixed &>/dev/null; then
         ok "TPM2 is responsive"
     else
-        warn "TPM2 device found but not responding — check tpm2-abrmd service"
+        requirement_fail "TPM2 device is present but not responding."
     fi
 else
-    echo ""
-    echo "  ────────────────────────────────────────────────────────"
-    echo "  TPM2 is required but was not detected on this system."
-    echo ""
-    echo "  TPM2 is usually disabled in BIOS/UEFI by default."
-    echo "  To enable it:"
-    echo ""
-    echo "  1. Reboot your machine"
-    echo "  2. Enter BIOS/UEFI firmware (F2, F12, DEL, or ESC)"
-    echo "  3. Find Security settings"
-    echo "  4. Look for: TPM, TPM2, PTT (Intel), fTPM (AMD), or"
-    echo "     Trusted Platform Module"
-    echo "  5. Enable it"
-    echo "  6. Save and reboot"
-    echo "  7. Run this installer again"
-    echo ""
-    echo "  Note: Some older machines do not have a TPM2 chip."
-    echo "  If TPM settings are not in your BIOS, your hardware"
-    echo "  may not support it."
-    echo "  ────────────────────────────────────────────────────────"
-    echo ""
-    die "TPM2 not found. Enable TPM2 in BIOS and run this script again."
+    requirement_fail "TPM2 device nodes /dev/tpm0 and /dev/tpmrm0 were not found."
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -409,22 +256,26 @@ detect_esp() {
     return 1
 }
 
-ESP="$(detect_esp)" || die "Cannot detect EFI System Partition. Is this a UEFI system?"
-ok "EFI System Partition: ${ESP}"
+ESP="$(detect_esp || true)"
+if [[ -n "${ESP}" ]]; then
+    ok "EFI System Partition: ${ESP}"
+else
+    requirement_fail "EFI System Partition could not be detected."
+fi
 
 BOOTLOADER="unknown"
-if [[ -f "${ESP}/EFI/systemd/systemd-bootx64.efi" ]] || \
-   [[ -f "${ESP}/EFI/systemd/systemd-bootaa64.efi" ]]; then
+if [[ -n "${ESP}" && ( -f "${ESP}/EFI/systemd/systemd-bootx64.efi" || \
+   -f "${ESP}/EFI/systemd/systemd-bootaa64.efi" ) ]]; then
     BOOTLOADER="systemd-boot"
     ok "Bootloader: systemd-boot"
-elif [[ -f "${ESP}/EFI/grub/grubx64.efi" ]] || \
-     [[ -f "${ESP}/EFI/grub2/grubx64.efi" ]] || \
+elif [[ -n "${ESP}" && ( -f "${ESP}/EFI/grub/grubx64.efi" || \
+     -f "${ESP}/EFI/grub2/grubx64.efi" ) ]] || \
      command -v grub-install &>/dev/null || \
      command -v grub2-install &>/dev/null; then
     BOOTLOADER="grub"
-    ok "Bootloader: GRUB"
+    requirement_fail "Bootloader is GRUB. MyKey currently requires systemd-boot."
 else
-    warn "Could not detect bootloader"
+    requirement_fail "Bootloader could not be detected as systemd-boot."
     BOOTLOADER="unknown"
 fi
 
@@ -441,85 +292,74 @@ should_exclude() {
 }
 
 detect_files_to_sign() {
-    info "Scanning for files to sign..."
+    info "Scanning for required signed EFI files..."
 
-    if [[ "${BOOTLOADER}" == "systemd-boot" ]]; then
-        for f in \
-            "${ESP}/EFI/systemd/systemd-bootx64.efi" \
-            "${ESP}/EFI/systemd/systemd-bootaa64.efi" \
-            "${ESP}/EFI/BOOT/BOOTX64.EFI" \
-            "${ESP}/EFI/BOOT/bootx64.efi"
-        do
-            if [[ -f "${f}" ]]; then
-                if should_exclude "${f}"; then
-                    warn "Auto-excluded: ${f}"
-                else
-                    FILES_TO_SIGN+=("${f}")
-                fi
+    if [[ -z "${ESP}" || "${BOOTLOADER}" != "systemd-boot" ]]; then
+        return
+    fi
+
+    for f in \
+        "${ESP}/EFI/systemd/systemd-bootx64.efi" \
+        "${ESP}/EFI/systemd/systemd-bootaa64.efi" \
+        "${ESP}/EFI/BOOT/BOOTX64.EFI" \
+        "${ESP}/EFI/BOOT/bootx64.efi"
+    do
+        if [[ -f "${f}" ]]; then
+            if should_exclude "${f}"; then
+                warn "Auto-excluded: ${f}"
+            else
+                FILES_TO_SIGN+=("${f}")
             fi
-        done
+        fi
+    done
 
-        for f in "${ESP}/EFI/Linux/"*.efi; do
-            if [[ -f "${f}" ]]; then
-                if should_exclude "${f}"; then
-                    warn "Auto-excluded (Windows/Microsoft file): ${f}"
-                else
-                    FILES_TO_SIGN+=("${f}")
-                fi
-            fi
-        done
-
-        for dir in \
-            "${ESP}/EFI/arch" \
-            "${ESP}/EFI/ubuntu" \
-            "${ESP}/EFI/fedora" \
-            "${ESP}/EFI/opensuse"
-        do
-            for f in "${dir}/"*.efi; do
-                if [[ -f "${f}" ]]; then
-                    if should_exclude "${f}"; then
-                        warn "Auto-excluded (Windows/Microsoft file): ${f}"
-                    else
-                        FILES_TO_SIGN+=("${f}")
-                    fi
-                fi
-            done
-        done
-
-    elif [[ "${BOOTLOADER}" == "grub" ]]; then
-        for f in \
-            "${ESP}/EFI/grub/grubx64.efi" \
-            "${ESP}/EFI/grub2/grubx64.efi" \
-            "${ESP}/EFI/BOOT/BOOTX64.EFI" \
-            "${ESP}/EFI/BOOT/bootx64.efi"
-        do
-            if [[ -f "${f}" ]]; then
-                if should_exclude "${f}"; then
-                    warn "Auto-excluded (Windows/Microsoft file): ${f}"
-                else
-                    FILES_TO_SIGN+=("${f}")
-                fi
-            fi
-        done
-        warn "GRUB detected: kernel signing depends on your shim setup"
-        warn "If using shim, your distro manages kernel signing separately"
-    else
-        while IFS= read -r -d '' f; do
+    for f in "${ESP}/EFI/Linux/"*.efi; do
+        if [[ -f "${f}" ]]; then
             if should_exclude "${f}"; then
                 warn "Auto-excluded (Windows/Microsoft file): ${f}"
             else
                 FILES_TO_SIGN+=("${f}")
             fi
-        done < <(find "${ESP}" -name "*.efi" -print0 2>/dev/null)
-    fi
+        fi
+    done
 
-    # Deduplicate
+    for dir in \
+        "${ESP}/EFI/arch" \
+        "${ESP}/EFI/ubuntu" \
+        "${ESP}/EFI/fedora" \
+        "${ESP}/EFI/opensuse"
+    do
+        for f in "${dir}/"*.efi; do
+            if [[ -f "${f}" ]]; then
+                if should_exclude "${f}"; then
+                    warn "Auto-excluded (Windows/Microsoft file): ${f}"
+                else
+                    FILES_TO_SIGN+=("${f}")
+                fi
+            fi
+        done
+    done
+
+    # Deduplicate by backing file identity first, then by literal path.
+    # Some ESPs expose the same EFI binary under multiple case variants
+    # (for example BOOTX64.EFI and bootx64.efi) that resolve to the same inode.
     local -A seen
+    local -A seen_inode
     local deduped=()
     local f
     for f in "${FILES_TO_SIGN[@]:-}"; do
+        local inode_key=""
+        if [[ -e "${f}" ]]; then
+            inode_key="$(stat -Lc '%d:%i' "${f}" 2>/dev/null || true)"
+        fi
+        if [[ -n "${inode_key}" && -n "${seen_inode[${inode_key}]:-}" ]]; then
+            continue
+        fi
         if [[ -z "${seen[${f}]:-}" ]]; then
             seen["${f}"]=1
+            if [[ -n "${inode_key}" ]]; then
+                seen_inode["${inode_key}"]=1
+            fi
             deduped+=("${f}")
         fi
     done
@@ -532,13 +372,50 @@ detect_files_to_sign() {
 detect_files_to_sign
 
 if [[ ${#FILES_TO_SIGN[@]} -gt 0 ]]; then
-    info "Files that will be signed with Secure Boot keys:"
+    info "Required signed EFI files:"
     for f in "${FILES_TO_SIGN[@]}"; do
         echo "      ${f}"
     done
 else
-    warn "No EFI files found to sign"
+    requirement_fail "No required EFI files were found to verify."
 fi
+
+verify_required_efi_files() {
+    if [[ ${#FILES_TO_SIGN[@]} -eq 0 ]]; then
+        return
+    fi
+
+    if ! command -v sbctl &>/dev/null; then
+        requirement_fail "sbctl is required to verify Secure Boot file signatures."
+        return
+    fi
+
+    echo ""
+    info "Checking required EFI files in sbctl..."
+    local file_db verify_out signed_count
+    file_db="$(sudo sbctl list-files 2>/dev/null || true)"
+    for f in "${FILES_TO_SIGN[@]}"; do
+        if printf '%s\n' "${file_db}" | grep -Fq "${f}"; then
+            ok "Enrolled: ${f}"
+        else
+            requirement_fail "Required EFI file is not enrolled in sbctl: ${f}"
+        fi
+    done
+
+    echo ""
+    info "Verifying EFI signatures..."
+    verify_out="$(sudo sbctl verify 2>&1 || true)"
+    signed_count=$(printf '%s\n' "${verify_out}" | grep -c "✓" || true)
+
+    if [[ "${signed_count}" -lt "${#FILES_TO_SIGN[@]}" ]]; then
+        requirement_fail "sbctl verify reported ${signed_count} signed EFI file(s), fewer than the ${#FILES_TO_SIGN[@]} required file(s)."
+    else
+        ok "Required EFI files appear signed."
+    fi
+}
+
+verify_required_efi_files
+enforce_prechecks
 
 # ════════════════════════════════════════════════════════════════════════════
 # PHASE 4 — BUILD AND INSTALL
@@ -553,11 +430,13 @@ DAEMON_BINARY="mykey-daemon"
 TRAY_BINARY="mykey-tray"
 SECRETS_BINARY="mykey-secrets"
 PIN_BINARY="mykey-pin"
+PIN_HELPER_BINARY="mykey-pin-auth"
 HOST_DEST="/usr/local/bin/${HOST_BINARY}"
 DAEMON_DEST="/usr/local/bin/${DAEMON_BINARY}"
 TRAY_DEST="/usr/local/bin/${TRAY_BINARY}"
 SECRETS_DEST="/usr/local/bin/${SECRETS_BINARY}"
 PIN_DEST="/usr/local/bin/mykey-pin"
+PIN_HELPER_DEST="/usr/local/bin/mykey-pin-auth"
 PIN_SO_DEST="/usr/lib/security/mykeypin.so"
 PIN_DIR="/etc/mykey/pin"
 HOST_MANIFEST_SRC="${REPO_ROOT}/scripts/com.mykey.host.json"
@@ -631,7 +510,7 @@ sudo chmod 755 "${WEBAUTHN_DIR}"
 sudo install -d -m 0700 -o "${REAL_USER}" "${WEBAUTHN_DIR}/secrets"
 sudo install -d -m 0700 -o "${REAL_USER}" "${WEBAUTHN_DIR}/secrets/default"
 sudo install -d -m 0700 -o "${REAL_USER}" "${WEBAUTHN_DIR}/provider"
-sudo install -d -m 0700 -o "${REAL_USER}" "${PIN_DIR}"
+sudo install -d -m 0700 -o "${DAEMON_USER}" "${PIN_DIR}"
 # Restore /etc/mykey — 711 allows traversal by the real user without exposing listings
 sudo chmod 711 "${WEBAUTHN_DIR}"
 ok "Directories ready."
@@ -781,91 +660,17 @@ sudo install -m 0755 "${REPO_ROOT}/mykey-pin/target/release/mykey-pin" \
     "${PIN_DEST}"
 ok "${PIN_DEST}"
 
-# ── 4.23 Install mykeypin.so PAM module ──────────────────────────────────
+# ── 4.23 Install mykey-pin-auth helper ────────────────────────────────────
+sudo install -m 0755 "${REPO_ROOT}/mykey-pin/target/release/${PIN_HELPER_BINARY}" \
+    "${PIN_HELPER_DEST}"
+ok "${PIN_HELPER_DEST}"
+
+# ── 4.24 Install mykeypin.so PAM module ──────────────────────────────────
 sudo install -m 0755 "${REPO_ROOT}/mykey-pin/target/release/libmykeypin.so" \
     "${PIN_SO_DEST}"
 ok "${PIN_SO_DEST}"
 
-# ════════════════════════════════════════════════════════════════════════════
-# PHASE 5 — SIGN BINARIES WITH SECURE BOOT KEYS
-# ════════════════════════════════════════════════════════════════════════════
-echo ""
-echo "════════════════════════════════════════════════════════════"
-echo " Phase 5 — Sign Binaries"
-echo "════════════════════════════════════════════════════════════"
-
-if command -v sbctl &>/dev/null && [[ "${SB_STATE:-}" != "skip" && "${SB_STATE:-}" != "disabled" && "${SB_STATE:-}" != "unknown" ]]; then
-
-    # ── Per-file prompt for EFI boot files ───────────────────────
-    if [[ ${#FILES_TO_SIGN[@]} -gt 0 ]]; then
-        echo ""
-        info "EFI boot file signing — you will be asked about each file."
-        info "Only sign Linux bootloader and UKI files."
-        info "Do NOT sign Windows files — they are already signed by Microsoft."
-        echo ""
-
-        for f in "${FILES_TO_SIGN[@]:-}"; do
-            if [[ ! -f "${f}" ]]; then
-                warn "File not found, skipping: ${f}"
-                continue
-            fi
-
-            echo ""
-            echo "  ──────────────────────────────────────────────────────"
-            echo "  File: ${f}"
-            echo ""
-            echo "  Is this a Linux bootloader or UKI file that you want"
-            echo "  protected by Secure Boot? If this is a Windows file,"
-            echo "  choose S to skip."
-            echo "  ──────────────────────────────────────────────────────"
-            echo ""
-
-            while true; do
-                read -rp "  Sign this file? [Y]es / [S]kip / [Q]uit signing: " SIGN_CHOICE
-                case "${SIGN_CHOICE,,}" in
-                    y|yes)
-                        sudo sbctl sign --save "${f}"
-                        ok "Signed and saved: ${f}"
-                        break
-                        ;;
-                    s|skip)
-                        warn "Skipped: ${f}"
-                        break
-                        ;;
-                    q|quit)
-                        warn "Signing cancelled — remaining files not signed"
-                        break 2
-                        ;;
-                    *)
-                        echo "  Please type Y, S, or Q"
-                        ;;
-                esac
-            done
-        done
-    fi
-
-    # ── Verify and summarise ──────────────────────────────────────
-    echo ""
-    info "Verifying signatures..."
-    VERIFY_OUT="$(sudo sbctl verify 2>&1 || true)"
-    SIGNED=$(echo "${VERIFY_OUT}" | grep -c "✓" || true)
-    UNSIGNED=$(echo "${VERIFY_OUT}" | grep -c "✗" || true)
-    ok "Signature verification: ${SIGNED} signed, ${UNSIGNED} not signed"
-    info "(Unsigned Microsoft/Windows files are expected and normal)"
-
-else
-    info "Skipping binary signing (Secure Boot not active or sbctl not available)"
-    # Still add our binaries to sbctl database if sbctl exists
-    # so they get signed when Secure Boot is later enabled
-    if command -v sbctl &>/dev/null; then
-        info "Registering binaries with sbctl for future signing..."
-        for bin in "${HOST_DEST}" "${DAEMON_DEST}" "${TRAY_DEST}"; do
-            [[ -f "${bin}" ]] && sudo sbctl sign --save "${bin}" 2>/dev/null || true
-        done
-    fi
-fi
-
-# Update binary hashes AFTER signing — signing changes the file and its SHA-256
+# Update binary hashes after installation
 echo ""
 info "Updating trusted binary hashes..."
 HOST_HASH="$(sha256sum "${HOST_DEST}" | awk '{print $1}')"
@@ -879,11 +684,11 @@ EOF
 ok "Binary hashes updated"
 
 # ════════════════════════════════════════════════════════════════════════════
-# PHASE 6 — START SERVICES
+# PHASE 5 — START SERVICES
 # ════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "════════════════════════════════════════════════════════════"
-echo " Phase 6 — Start Services"
+echo " Phase 5 — Start Services"
 echo "════════════════════════════════════════════════════════════"
 
 echo ""
@@ -918,11 +723,11 @@ info "Running mykey-migrate --enroll..."
 mykey-migrate --enroll || die "Enrollment failed. Fix the error above and run ./scripts/install.sh again."
 
 # ════════════════════════════════════════════════════════════════════════════
-# PHASE 7 — EXTENSION SETUP
+# PHASE 6 — EXTENSION SETUP
 # ════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "════════════════════════════════════════════════════════════"
-echo " Phase 7 — Browser Extension Setup"
+echo " Phase 6 — Browser Extension Setup"
 echo "════════════════════════════════════════════════════════════"
 
 declare -A BROWSERS
@@ -1076,11 +881,11 @@ echo ""
 read -rp "  Press Enter once you have reloaded the extension..."
 
 # ════════════════════════════════════════════════════════════════════════════
-# PHASE 8 — FINAL HEALTH CHECK
+# PHASE 7 — FINAL HEALTH CHECK
 # ════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "════════════════════════════════════════════════════════════"
-echo " Phase 8 — Final Health Check"
+echo " Phase 7 — Final Health Check"
 echo "════════════════════════════════════════════════════════════"
 echo ""
 
@@ -1089,7 +894,7 @@ echo "[1/9] Secure Boot..."
 SB_FINAL="$(detect_secure_boot_state)"
 case "${SB_FINAL}" in
     enabled) ok "Secure Boot is enabled" ;;
-    *)       warn "Secure Boot is not enabled — key protection is reduced" ;;
+    *)       fail "Secure Boot is not enabled"; FAILED=1 ;;
 esac
 
 # [2/9] TPM2
@@ -1103,7 +908,7 @@ fi
 
 # [3/9] Binaries
 echo "[3/9] Binaries..."
-for bin in "${HOST_BINARY}" "${DAEMON_BINARY}" "${TRAY_BINARY}" "${SECRETS_BINARY}" "mykey-migrate" "${PIN_BINARY}"; do
+for bin in "${HOST_BINARY}" "${DAEMON_BINARY}" "${TRAY_BINARY}" "${SECRETS_BINARY}" "mykey-migrate" "${PIN_BINARY}" "${PIN_HELPER_BINARY}"; do
     if [[ -x "/usr/local/bin/${bin}" ]]; then
         ok "/usr/local/bin/${bin}"
     else

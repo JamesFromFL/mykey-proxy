@@ -30,8 +30,18 @@ use zbus::{CacheProperties, Connection};
 )]
 trait DaemonIface {
     async fn connect(&self, pid: u32) -> zbus::Result<Vec<u8>>;
-    async fn seal_secret(&self, pid: u32, data: Vec<u8>) -> zbus::Result<Vec<u8>>;
-    async fn unseal_secret(&self, pid: u32, blob: Vec<u8>) -> zbus::Result<Vec<u8>>;
+    async fn confirm_user_presence(&self, pid: u32) -> zbus::Result<bool>;
+    async fn pin_status(&self, pid: u32, target_uid: u32) -> zbus::Result<(bool, u64, u32)>;
+    async fn pin_enroll(&self, pid: u32, target_uid: u32, pin: Vec<u8>) -> zbus::Result<()>;
+    async fn pin_verify(&self, pid: u32, target_uid: u32, pin: Vec<u8>) -> zbus::Result<bool>;
+    async fn pin_change(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        old_pin: Vec<u8>,
+        new_pin: Vec<u8>,
+    ) -> zbus::Result<bool>;
+    async fn pin_reset(&self, pid: u32, target_uid: u32) -> zbus::Result<()>;
     async fn disconnect(&self, pid: u32) -> zbus::Result<()>;
 }
 
@@ -62,6 +72,13 @@ pub struct DaemonClient {
     pid: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinStatus {
+    pub is_set: bool,
+    pub cooldown_remaining_secs: u64,
+    pub failed_sessions: u32,
+}
+
 impl DaemonClient {
     /// Connect to the system bus and call Connect(pid) to establish a session.
     pub async fn connect() -> Result<Self, String> {
@@ -82,24 +99,84 @@ impl DaemonClient {
         Ok(DaemonClient { conn, pid })
     }
 
-    /// Seal `data` via the daemon's TPM2 and return the sealed blob.
-    pub async fn seal_secret(&self, data: &[u8]) -> Result<Vec<u8>, String> {
-        debug!("[daemon_client] SealSecret ({} bytes)", data.len());
-        make_proxy(&self.conn)
+    /// Return daemon-owned PIN state for `target_uid`.
+    pub async fn pin_status(&self, target_uid: u32) -> Result<PinStatus, String> {
+        debug!("[daemon_client] PinStatus (target_uid={target_uid})");
+        let (is_set, cooldown_remaining_secs, failed_sessions) = make_proxy(&self.conn)
             .await?
-            .seal_secret(self.pid, data.to_vec())
+            .pin_status(self.pid, target_uid)
             .await
-            .map_err(|e| format!("D-Bus SealSecret failed: {e}"))
+            .map_err(|e| format!("D-Bus PinStatus failed: {e}"))?;
+        Ok(PinStatus {
+            is_set,
+            cooldown_remaining_secs,
+            failed_sessions,
+        })
     }
 
-    /// Unseal a blob previously produced by `seal_secret`.
-    pub async fn unseal_secret(&self, blob: &[u8]) -> Result<Vec<u8>, String> {
-        debug!("[daemon_client] UnsealSecret ({} bytes)", blob.len());
+    /// Trigger a fresh polkit user-presence check for this frontend.
+    pub async fn confirm_user_presence(&self) -> Result<bool, String> {
+        debug!("[daemon_client] ConfirmUserPresence");
         make_proxy(&self.conn)
             .await?
-            .unseal_secret(self.pid, blob.to_vec())
+            .confirm_user_presence(self.pid)
             .await
-            .map_err(|e| format!("D-Bus UnsealSecret failed: {e}"))
+            .map_err(|e| format!("D-Bus ConfirmUserPresence failed: {e}"))
+    }
+
+    /// Enroll a new PIN for `target_uid` through the daemon.
+    pub async fn pin_enroll(&self, target_uid: u32, pin: &[u8]) -> Result<(), String> {
+        debug!(
+            "[daemon_client] PinEnroll (target_uid={target_uid}, {} bytes)",
+            pin.len()
+        );
+        make_proxy(&self.conn)
+            .await?
+            .pin_enroll(self.pid, target_uid, pin.to_vec())
+            .await
+            .map_err(|e| format!("D-Bus PinEnroll failed: {e}"))
+    }
+
+    /// Verify a PIN for `target_uid` through the daemon.
+    pub async fn pin_verify(&self, target_uid: u32, pin: &[u8]) -> Result<bool, String> {
+        debug!(
+            "[daemon_client] PinVerify (target_uid={target_uid}, {} bytes)",
+            pin.len()
+        );
+        make_proxy(&self.conn)
+            .await?
+            .pin_verify(self.pid, target_uid, pin.to_vec())
+            .await
+            .map_err(|e| format!("D-Bus PinVerify failed: {e}"))
+    }
+
+    /// Change the enrolled PIN for `target_uid` through the daemon.
+    pub async fn pin_change(
+        &self,
+        target_uid: u32,
+        old_pin: &[u8],
+        new_pin: &[u8],
+    ) -> Result<bool, String> {
+        debug!(
+            "[daemon_client] PinChange (target_uid={target_uid}, old={} bytes, new={} bytes)",
+            old_pin.len(),
+            new_pin.len()
+        );
+        make_proxy(&self.conn)
+            .await?
+            .pin_change(self.pid, target_uid, old_pin.to_vec(), new_pin.to_vec())
+            .await
+            .map_err(|e| format!("D-Bus PinChange failed: {e}"))
+    }
+
+    /// Remove PIN state for `target_uid` through the daemon.
+    pub async fn pin_reset(&self, target_uid: u32) -> Result<(), String> {
+        debug!("[daemon_client] PinReset (target_uid={target_uid})");
+        make_proxy(&self.conn)
+            .await?
+            .pin_reset(self.pid, target_uid)
+            .await
+            .map_err(|e| format!("D-Bus PinReset failed: {e}"))
     }
 
     /// Disconnect from the daemon, revoking the session token.

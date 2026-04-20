@@ -11,16 +11,19 @@
 //   UnsealSecret(pid, blob)           → plaintext bytes (Vec<u8>)
 //   Disconnect(pid)                   → ()
 //
-// The native host supplies its own PID.  In production the daemon should
-// cross-check this against the D-Bus connection's Unix credentials, but for
-// the initial implementation we trust the caller-supplied value and note this
-// as a future hardening item.
+// Callers supply their own PID, but the daemon cross-checks it against the
+// D-Bus sender's Unix credentials before accepting the request.
 
 use std::sync::Arc;
 use log::{debug, info, warn};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
+use zbus::{message::Header, Connection};
 
 use crate::authentication;
 use crate::crypto;
+use crate::pam;
+use crate::pin_store::PinStore;
 use crate::protocol::{CreateRequest, GetRequest};
 use crate::registration;
 use crate::replay::AsyncReplayCache;
@@ -36,6 +39,7 @@ use crate::validator;
 pub struct DaemonState {
     pub sessions:     SessionStore,
     pub replay_cache: AsyncReplayCache,
+    pub pin_store:    PinStore,
 }
 
 impl DaemonState {
@@ -43,6 +47,7 @@ impl DaemonState {
         DaemonState {
             sessions:     SessionStore::new(),
             replay_cache: AsyncReplayCache::new(),
+            pin_store:    PinStore::default(),
         }
     }
 }
@@ -60,6 +65,12 @@ pub struct DaemonInterface {
     state: Arc<DaemonState>,
 }
 
+#[derive(Debug, Clone)]
+struct CallerIdentity {
+    uid: u32,
+    mykey_program: Option<&'static str>,
+}
+
 impl DaemonInterface {
     pub fn new(state: Arc<DaemonState>) -> Self {
         DaemonInterface { state }
@@ -73,28 +84,21 @@ impl DaemonInterface {
 #[zbus::interface(name = "com.mykey.Daemon")]
 impl DaemonInterface {
     // ── Connect ─────────────────────────────────────────────────────────────
-    /// Called by the native host on startup.
+    /// Called by a trusted MyKey or browser-side process on startup.
     ///
-    /// Validates that `pid` belongs to a Chrome/Chromium process, then issues a
-    /// fresh session token and returns the raw 32-byte token over the kernel-
-    /// mediated D-Bus system bus.  The system bus guarantees that only
-    /// authorised processes (policy file) can reach this method, so no
-    /// additional bootstrap-key encryption layer is required.
-    async fn connect(&self, pid: u32) -> Result<Vec<u8>, zbus::fdo::Error> {
+    /// Cross-checks the claimed `pid` against the D-Bus sender's Unix
+    /// credentials, validates that the process is a recognised browser or
+    /// trusted MyKey binary, then issues a fresh session token and returns the
+    /// raw 32-byte token over the kernel-mediated D-Bus system bus.
+    async fn connect(
+        &self,
+        pid: u32,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<Vec<u8>, zbus::fdo::Error> {
         info!("[dbus] Connect called from pid={pid}");
 
-        let browser_ok = validator::verify_caller_process(pid);
-        let mykey_ok = if !browser_ok {
-            validator::verify_mykey_caller(pid)
-        } else {
-            false
-        };
-        if !browser_ok && !mykey_ok {
-            warn!("[dbus] Connect rejected: pid={pid} failed caller verification");
-            return Err(zbus::fdo::Error::AccessDenied(
-                format!("pid={pid} is not a recognised browser or MyKey process"),
-            ));
-        }
+        self.authorize_call(conn, &header, pid).await?;
 
         let token_bytes = self.state.sessions.issue_token(pid).await;
 
@@ -115,8 +119,12 @@ impl DaemonInterface {
         &self,
         pid: u32,
         encrypted_request: Vec<u8>,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<Vec<u8>, zbus::fdo::Error> {
         debug!("[dbus] Register called from pid={pid}");
+
+        self.authorize_call(conn, &header, pid).await?;
 
         // Decrypt request using this pid's session token
         let plaintext = self
@@ -170,8 +178,12 @@ impl DaemonInterface {
         &self,
         pid: u32,
         encrypted_request: Vec<u8>,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<Vec<u8>, zbus::fdo::Error> {
         debug!("[dbus] Authenticate called from pid={pid}");
+
+        self.authorize_call(conn, &header, pid).await?;
 
         let plaintext = self
             .decrypt_with_session(pid, &encrypted_request)
@@ -220,8 +232,16 @@ impl DaemonInterface {
     ///
     /// The caller must have an active session established via Connect.  The
     /// daemon logs byte counts only — never the data content.
-    async fn seal_secret(&self, pid: u32, data: Vec<u8>) -> Result<Vec<u8>, zbus::fdo::Error> {
+    async fn seal_secret(
+        &self,
+        pid: u32,
+        data: Vec<u8>,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<Vec<u8>, zbus::fdo::Error> {
         info!("[dbus] SealSecret called from pid={pid} ({} bytes)", data.len());
+
+        self.authorize_call(conn, &header, pid).await?;
 
         if self.state.sessions.with_token(pid, |_| ()).await.is_none() {
             warn!("[dbus] SealSecret rejected: no session for pid={pid}");
@@ -243,8 +263,16 @@ impl DaemonInterface {
     /// The caller must have an active session.  Fails if PCR values have
     /// changed since sealing.  The daemon logs byte counts only — never the
     /// plaintext content.
-    async fn unseal_secret(&self, pid: u32, blob: Vec<u8>) -> Result<Vec<u8>, zbus::fdo::Error> {
+    async fn unseal_secret(
+        &self,
+        pid: u32,
+        blob: Vec<u8>,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<Vec<u8>, zbus::fdo::Error> {
         info!("[dbus] UnsealSecret called from pid={pid} ({} bytes)", blob.len());
+
+        self.authorize_call(conn, &header, pid).await?;
 
         if self.state.sessions.with_token(pid, |_| ()).await.is_none() {
             warn!("[dbus] UnsealSecret rejected: no session for pid={pid}");
@@ -262,10 +290,128 @@ impl DaemonInterface {
 
     // ── Disconnect ────────────────────────────────────────────────────────────
     /// Revoke the session token for `pid` and clean up state.
-    async fn disconnect(&self, pid: u32) -> Result<(), zbus::fdo::Error> {
+    async fn disconnect(
+        &self,
+        pid: u32,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), zbus::fdo::Error> {
         info!("[dbus] Disconnect called from pid={pid}");
+
+        self.authorize_call(conn, &header, pid).await?;
+
         self.state.sessions.revoke_token(pid).await;
         Ok(())
+    }
+
+    // ── PinStatus ────────────────────────────────────────────────────────────
+    /// Return basic PIN state for `target_uid`.
+    ///
+    /// Tuple layout:
+    ///   `(pin_is_set, cooldown_remaining_secs, failed_sessions)`
+    async fn pin_status(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(bool, u64, u32), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_pin_call(conn, &header, pid, target_uid)
+            .await?;
+        self.pin_status_for_uid(target_uid)
+    }
+
+    // ── PinEnroll ────────────────────────────────────────────────────────────
+    /// Enroll a new PIN for `target_uid`.
+    ///
+    /// This low-level daemon method does not implement final UX policy. It is
+    /// intended to be called by trusted MyKey frontends after they have
+    /// completed any higher-level enrollment checks.
+    async fn pin_enroll(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        pin: Vec<u8>,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_pin_call(conn, &header, pid, target_uid)
+            .await?;
+        self.pin_enroll_for_uid(target_uid, pin)
+    }
+
+    // ── PinVerify ────────────────────────────────────────────────────────────
+    /// Verify the PIN for `target_uid`.
+    ///
+    /// Returns `true` on success, `false` on mismatch or active PIN lockout.
+    async fn pin_verify(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        pin: Vec<u8>,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<bool, zbus::fdo::Error> {
+        let _identity = self
+            .authorize_pin_call(conn, &header, pid, target_uid)
+            .await?;
+        self.pin_verify_for_uid(target_uid, pin)
+    }
+
+    // ── PinChange ────────────────────────────────────────────────────────────
+    /// Change the PIN for `target_uid`.
+    ///
+    /// Returns `true` if the current PIN verified and the new PIN was written.
+    /// Returns `false` on mismatch or active PIN lockout.
+    async fn pin_change(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        old_pin: Vec<u8>,
+        new_pin: Vec<u8>,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<bool, zbus::fdo::Error> {
+        let _identity = self
+            .authorize_pin_call(conn, &header, pid, target_uid)
+            .await?;
+        self.pin_change_for_uid(target_uid, old_pin, new_pin)
+    }
+
+    // ── PinReset ─────────────────────────────────────────────────────────────
+    /// Remove all stored PIN state for `target_uid`.
+    async fn pin_reset(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_pin_call(conn, &header, pid, target_uid)
+            .await?;
+        self.pin_reset_for_uid(target_uid)
+    }
+
+    // ── ConfirmUserPresence ────────────────────────────────────────────────
+    /// Trigger a fresh polkit user-presence check for the calling process.
+    ///
+    /// Intended for management actions such as first-time PIN enrollment and
+    /// PIN reset, where the current PIN is not available as a gate.
+    async fn confirm_user_presence(
+        &self,
+        pid: u32,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<bool, zbus::fdo::Error> {
+        let _identity = self
+            .authorize_pin_management_call(conn, &header, pid)
+            .await?;
+        pam::verify_user_presence(pid)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("User presence verification failed: {e}")))
     }
 }
 
@@ -274,6 +420,273 @@ impl DaemonInterface {
 // ---------------------------------------------------------------------------
 
 impl DaemonInterface {
+    async fn authorize_call(
+        &self,
+        conn: &Connection,
+        header: &Header<'_>,
+        pid: u32,
+    ) -> Result<CallerIdentity, zbus::fdo::Error> {
+        let sender = header.sender().ok_or_else(|| {
+            zbus::fdo::Error::AccessDenied("D-Bus message is missing sender identity".to_string())
+        })?;
+
+        let dbus = zbus::fdo::DBusProxy::new(conn)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Cannot create DBus proxy: {e}")))?;
+        let credentials = dbus
+            .get_connection_credentials(sender.to_owned().into())
+            .await
+            .map_err(|e| {
+                zbus::fdo::Error::AccessDenied(format!(
+                    "Cannot resolve D-Bus credentials for sender {sender}: {e}"
+                ))
+            })?;
+
+        let actual_pid = credentials.process_id().ok_or_else(|| {
+            zbus::fdo::Error::AccessDenied(format!(
+                "D-Bus did not provide a process ID for sender {sender}"
+            ))
+        })?;
+        if actual_pid != pid {
+            warn!(
+                "[dbus] Caller PID mismatch: sender={sender} supplied pid={pid} actual pid={actual_pid}"
+            );
+            return Err(zbus::fdo::Error::AccessDenied(format!(
+                "Caller PID mismatch: sender {sender} is process {actual_pid}, not {pid}"
+            )));
+        }
+
+        let uid = credentials.unix_user_id().ok_or_else(|| {
+            zbus::fdo::Error::AccessDenied(format!(
+                "D-Bus did not provide a Unix user ID for sender {sender}"
+            ))
+        })?;
+
+        let browser_ok = validator::verify_caller_process(pid);
+        let mykey_program = if !browser_ok {
+            validator::trusted_mykey_program(pid)
+        } else {
+            None
+        };
+        if !browser_ok && mykey_program.is_none() {
+            warn!("[dbus] Authorize rejected: pid={pid} failed caller verification");
+            return Err(zbus::fdo::Error::AccessDenied(format!(
+                "pid={pid} is not a recognised browser or MyKey process"
+            )));
+        }
+
+        Ok(CallerIdentity {
+            uid,
+            mykey_program,
+        })
+    }
+
+    async fn ensure_session(&self, pid: u32) -> Result<(), zbus::fdo::Error> {
+        if self.state.sessions.with_token(pid, |_| ()).await.is_none() {
+            warn!("[dbus] Request rejected: no session for pid={pid}");
+            return Err(zbus::fdo::Error::AccessDenied(format!(
+                "No session for pid={pid} — call Connect first"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn authorize_pin_call(
+        &self,
+        conn: &Connection,
+        header: &Header<'_>,
+        pid: u32,
+        target_uid: u32,
+    ) -> Result<CallerIdentity, zbus::fdo::Error> {
+        let identity = self.authorize_call(conn, header, pid).await?;
+        self.ensure_session(pid).await?;
+        self.ensure_pin_api_caller(&identity)?;
+        self.ensure_target_uid_access(&identity, target_uid)?;
+        Ok(identity)
+    }
+
+    async fn authorize_pin_management_call(
+        &self,
+        conn: &Connection,
+        header: &Header<'_>,
+        pid: u32,
+    ) -> Result<CallerIdentity, zbus::fdo::Error> {
+        let identity = self.authorize_call(conn, header, pid).await?;
+        self.ensure_session(pid).await?;
+        self.ensure_pin_management_caller(&identity)?;
+        Ok(identity)
+    }
+
+    fn ensure_pin_api_caller(&self, identity: &CallerIdentity) -> Result<(), zbus::fdo::Error> {
+        match identity.mykey_program {
+            Some("mykey-pin") | Some("mykey-pin-auth") | Some("mykey-manager") => Ok(()),
+            Some(other) => Err(zbus::fdo::Error::AccessDenied(format!(
+                "PIN APIs are not available to {other}"
+            ))),
+            None => Err(zbus::fdo::Error::AccessDenied(
+                "PIN APIs are only available to trusted MyKey frontends".to_string(),
+            )),
+        }
+    }
+
+    fn ensure_pin_management_caller(
+        &self,
+        identity: &CallerIdentity,
+    ) -> Result<(), zbus::fdo::Error> {
+        match identity.mykey_program {
+            Some("mykey-pin") | Some("mykey-manager") => Ok(()),
+            Some(other) => Err(zbus::fdo::Error::AccessDenied(format!(
+                "User-presence confirmation is not available to {other}"
+            ))),
+            None => Err(zbus::fdo::Error::AccessDenied(
+                "User-presence confirmation is only available to trusted MyKey frontends"
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn ensure_target_uid_access(
+        &self,
+        identity: &CallerIdentity,
+        target_uid: u32,
+    ) -> Result<(), zbus::fdo::Error> {
+        if identity.uid == 0 || identity.uid == target_uid {
+            Ok(())
+        } else {
+            Err(zbus::fdo::Error::AccessDenied(format!(
+                "Caller uid={} may not access PIN state for uid={target_uid}",
+                identity.uid
+            )))
+        }
+    }
+
+    fn pin_status_for_uid(&self, uid: u32) -> Result<(bool, u64, u32), zbus::fdo::Error> {
+        let is_set = self
+            .state
+            .pin_store
+            .pin_is_set(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN status failed: {e}")))?;
+        let attempts = self
+            .state
+            .pin_store
+            .read_attempts(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN attempts read failed: {e}")))?;
+        let cooldown_remaining = self
+            .state
+            .pin_store
+            .lockout_remaining(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN lockout check failed: {e}")))?
+            .unwrap_or(0);
+        Ok((is_set, cooldown_remaining, attempts.failed_sessions))
+    }
+
+    fn pin_enroll_for_uid(&self, uid: u32, pin: Vec<u8>) -> Result<(), zbus::fdo::Error> {
+        if self
+            .state
+            .pin_store
+            .pin_is_set(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN status failed: {e}")))?
+        {
+            return Err(zbus::fdo::Error::Failed(format!(
+                "A MyKey PIN is already set for uid={uid}"
+            )));
+        }
+
+        let pin = Zeroizing::new(pin);
+        let pin_hash = Zeroizing::new(hash_pin_bytes(pin.as_slice()));
+        let sealed = tpm::seal_blob(pin_hash.as_slice())
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN seal failed: {e}")))?;
+        self.state
+            .pin_store
+            .write_pin_blob(uid, &sealed)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN write failed: {e}")))?;
+        self.state
+            .pin_store
+            .record_success(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN attempts reset failed: {e}")))?;
+        Ok(())
+    }
+
+    fn pin_verify_for_uid(&self, uid: u32, pin: Vec<u8>) -> Result<bool, zbus::fdo::Error> {
+        if self
+            .state
+            .pin_store
+            .lockout_remaining(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN lockout check failed: {e}")))?
+            .is_some()
+        {
+            return Ok(false);
+        }
+
+        let sealed = self
+            .state
+            .pin_store
+            .read_pin_blob(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN read failed: {e}")))?
+            .ok_or_else(|| zbus::fdo::Error::Failed(format!("No MyKey PIN is set for uid={uid}")))?;
+        let stored_hash = tpm::unseal_blob(&sealed)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN unseal failed: {e}")))?;
+        let pin = Zeroizing::new(pin);
+        let entered_hash = Zeroizing::new(hash_pin_bytes(pin.as_slice()));
+
+        if entered_hash.as_slice() == stored_hash.as_slice() {
+            self.state
+                .pin_store
+                .record_success(uid)
+                .map_err(|e| zbus::fdo::Error::Failed(format!("PIN attempts reset failed: {e}")))?;
+            Ok(true)
+        } else {
+            self.state
+                .pin_store
+                .record_failed_attempt(uid)
+                .map_err(|e| zbus::fdo::Error::Failed(format!("PIN attempt write failed: {e}")))?;
+            Ok(false)
+        }
+    }
+
+    fn pin_change_for_uid(
+        &self,
+        uid: u32,
+        old_pin: Vec<u8>,
+        new_pin: Vec<u8>,
+    ) -> Result<bool, zbus::fdo::Error> {
+        if !self
+            .state
+            .pin_store
+            .pin_is_set(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN status failed: {e}")))?
+        {
+            return Err(zbus::fdo::Error::Failed(format!(
+                "No MyKey PIN is set for uid={uid}"
+            )));
+        }
+
+        if !self.pin_verify_for_uid(uid, old_pin)? {
+            return Ok(false);
+        }
+
+        let new_pin = Zeroizing::new(new_pin);
+        let pin_hash = Zeroizing::new(hash_pin_bytes(new_pin.as_slice()));
+        let sealed = tpm::seal_blob(pin_hash.as_slice())
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN seal failed: {e}")))?;
+        self.state
+            .pin_store
+            .write_pin_blob(uid, &sealed)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN write failed: {e}")))?;
+        self.state
+            .pin_store
+            .record_success(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN attempts reset failed: {e}")))?;
+        Ok(true)
+    }
+
+    fn pin_reset_for_uid(&self, uid: u32) -> Result<(), zbus::fdo::Error> {
+        self.state
+            .pin_store
+            .clear_pin(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN reset failed: {e}")))
+    }
+
     /// Decrypt `ciphertext` (JSON-serialised EncryptedPayload) using the
     /// session token for `pid`.
     async fn decrypt_with_session(&self, pid: u32, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
@@ -325,6 +738,12 @@ impl DaemonInterface {
     }
 }
 
+fn hash_pin_bytes(pin: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(pin);
+    hasher.finalize().to_vec()
+}
+
 // ---------------------------------------------------------------------------
 // Request envelope (authenticated + replay-protected)
 // ---------------------------------------------------------------------------
@@ -340,4 +759,85 @@ struct RequestEnvelope {
     hmac: Vec<u8>,
     /// The actual request payload (JSON bytes).
     payload: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replay::AsyncReplayCache;
+    use crate::session::SessionStore;
+
+    fn test_interface() -> DaemonInterface {
+        DaemonInterface::new(Arc::new(DaemonState {
+            sessions: SessionStore::new(),
+            replay_cache: AsyncReplayCache::new(),
+            pin_store: PinStore::new(std::env::temp_dir().join(format!(
+                "mykey-dbus-pin-test-{}",
+                std::process::id()
+            ))),
+        }))
+    }
+
+    fn identity(uid: u32, mykey_program: Option<&'static str>) -> CallerIdentity {
+        CallerIdentity { uid, mykey_program }
+    }
+
+    #[test]
+    fn pin_apis_only_allow_expected_frontends() {
+        let interface = test_interface();
+
+        assert!(interface
+            .ensure_pin_api_caller(&identity(1000, Some("mykey-pin")))
+            .is_ok());
+        assert!(interface
+            .ensure_pin_api_caller(&identity(1000, Some("mykey-pin-auth")))
+            .is_ok());
+        assert!(interface
+            .ensure_pin_api_caller(&identity(1000, Some("mykey-manager")))
+            .is_ok());
+
+        assert!(interface
+            .ensure_pin_api_caller(&identity(1000, Some("mykey-migrate")))
+            .is_err());
+        assert!(interface
+            .ensure_pin_api_caller(&identity(1000, None))
+            .is_err());
+    }
+
+    #[test]
+    fn pin_uid_access_is_bound_to_caller_uid_or_root() {
+        let interface = test_interface();
+
+        assert!(interface
+            .ensure_target_uid_access(&identity(1000, Some("mykey-pin")), 1000)
+            .is_ok());
+        assert!(interface
+            .ensure_target_uid_access(&identity(0, Some("mykey-pin-auth")), 1000)
+            .is_ok());
+        assert!(interface
+            .ensure_target_uid_access(&identity(1001, Some("mykey-pin")), 1000)
+            .is_err());
+    }
+
+    #[test]
+    fn user_presence_confirmation_is_limited_to_management_frontends() {
+        let interface = test_interface();
+
+        assert!(interface
+            .ensure_pin_management_caller(&identity(1000, Some("mykey-pin")))
+            .is_ok());
+        assert!(interface
+            .ensure_pin_management_caller(&identity(1000, Some("mykey-manager")))
+            .is_ok());
+
+        assert!(interface
+            .ensure_pin_management_caller(&identity(1000, Some("mykey-pin-auth")))
+            .is_err());
+        assert!(interface
+            .ensure_pin_management_caller(&identity(1000, Some("mykey-migrate")))
+            .is_err());
+        assert!(interface
+            .ensure_pin_management_caller(&identity(1000, None))
+            .is_err());
+    }
 }

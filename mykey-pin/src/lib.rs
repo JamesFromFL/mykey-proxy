@@ -4,12 +4,18 @@
 // Built as a cdylib; install as /lib/security/mykeypin.so (or libmykeypin.so
 // depending on distribution conventions).
 
-mod daemon_client;
-mod pin;
-
 use pam::{export_pam_module, PamModule, PamReturnCode};
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
+use std::io::Write;
 use std::os::raw::c_uint;
+use std::process::{Command, Stdio};
+
+use zeroize::Zeroizing;
+
+const PIN_HELPER_CANDIDATES: &[&str] = &[
+    "/usr/local/bin/mykey-pin-auth",
+    "/usr/bin/mykey-pin-auth",
+];
 
 // ---------------------------------------------------------------------------
 // Inline PAM FFI — avoids assumptions about pam_sys binding details.
@@ -58,6 +64,13 @@ mod pam_ffi {
             item_type: c_int,
             item: *mut *const c_void,
         ) -> c_int;
+
+        /// Retrieve the target PAM username from the handle.
+        pub fn pam_get_user(
+            pamh: *const c_void,
+            user: *mut *const c_char,
+            prompt: *const c_char,
+        ) -> c_int;
     }
 }
 
@@ -80,7 +93,6 @@ unsafe fn pam_converse(
 ) -> Option<String> {
     use pam_ffi::*;
 
-    // Retrieve the conversation struct from the PAM handle.
     let mut conv_ptr: *const libc::c_void = std::ptr::null();
     let rc = pam_get_item(
         handle as *const pam::PamHandle as *const libc::c_void,
@@ -93,8 +105,7 @@ unsafe fn pam_converse(
     let conv = &*(conv_ptr as *const PamConv);
     let conv_fn = conv.conv?;
 
-    // Build a single-message array.
-    let c_msg = std::ffi::CString::new(msg).ok()?;
+    let c_msg = CString::new(msg).ok()?;
     let pam_msg = PamMessage {
         msg_style,
         msg: c_msg.as_ptr(),
@@ -117,7 +128,6 @@ unsafe fn pam_converse(
         return None;
     }
 
-    // For prompts, extract the response string that the conversation filled in.
     if msg_style == PAM_PROMPT_ECHO_OFF {
         if resp_ptr.is_null() {
             return None;
@@ -133,12 +143,141 @@ unsafe fn pam_converse(
         libc::free(resp_ptr as *mut libc::c_void);
         result
     } else {
-        // For PAM_ERROR_MSG / PAM_TEXT_INFO the caller does not expect a response.
         if !resp_ptr.is_null() {
             libc::free(resp_ptr as *mut libc::c_void);
         }
         None
     }
+}
+
+unsafe fn pam_user(handle: &pam::PamHandle) -> Option<String> {
+    let mut user_ptr: *const libc::c_char = std::ptr::null();
+    let rc = pam_ffi::pam_get_user(
+        handle as *const pam::PamHandle as *const libc::c_void,
+        &mut user_ptr,
+        std::ptr::null(),
+    );
+    if rc != 0 || user_ptr.is_null() {
+        return None;
+    }
+    Some(CStr::from_ptr(user_ptr).to_string_lossy().into_owned())
+}
+
+fn user_to_uid(username: &str) -> Option<u32> {
+    let username = CString::new(username).ok()?;
+    let mut pwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let mut buf = vec![0u8; 1024];
+
+    loop {
+        let rc = unsafe {
+            libc::getpwnam_r(
+                username.as_ptr(),
+                pwd.as_mut_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == 0 {
+            if result.is_null() {
+                return None;
+            }
+            let pwd = unsafe { pwd.assume_init() };
+            return Some(pwd.pw_uid);
+        }
+        if rc == libc::ERANGE {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        return None;
+    }
+}
+
+enum HelperVerifyResult {
+    Success,
+    AuthFailed,
+    Locked(String),
+    NotConfigured(String),
+    Error(String),
+}
+
+fn run_pin_helper_verify(uid: u32, pin: &[u8]) -> HelperVerifyResult {
+    let helper_path = match resolve_pin_helper_path() {
+        Some(path) => path,
+        None => {
+            return HelperVerifyResult::Error(
+                "Could not find an installed mykey-pin-auth helper.".to_string(),
+            );
+        }
+    };
+
+    let mut child = match Command::new(helper_path)
+        .args(["verify", "--uid", &uid.to_string()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return HelperVerifyResult::Error(format!(
+                "Could not launch mykey-pin-auth: {e}"
+            ));
+        }
+    };
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        if let Err(e) = stdin.write_all(pin) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return HelperVerifyResult::Error(format!(
+                "Could not send PIN to mykey-pin-auth: {e}"
+            ));
+        }
+    } else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return HelperVerifyResult::Error(
+            "mykey-pin-auth did not expose a writable stdin".to_string(),
+        );
+    }
+
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(e) => {
+            return HelperVerifyResult::Error(format!(
+                "Failed waiting for mykey-pin-auth: {e}"
+            ));
+        }
+    };
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    match output.status.code() {
+        Some(0) => HelperVerifyResult::Success,
+        Some(1) => HelperVerifyResult::AuthFailed,
+        Some(3) => HelperVerifyResult::Locked(stderr),
+        Some(4) => HelperVerifyResult::NotConfigured(stderr),
+        Some(2) => HelperVerifyResult::Error(stderr),
+        Some(code) => HelperVerifyResult::Error(format!(
+            "mykey-pin-auth exited unexpectedly with status {code}"
+        )),
+        None => HelperVerifyResult::Error(
+            "mykey-pin-auth terminated without an exit status".to_string(),
+        ),
+    }
+}
+
+fn resolve_pin_helper_path() -> Option<&'static str> {
+    PIN_HELPER_CANDIDATES
+        .iter()
+        .copied()
+        .find(|path| std::path::Path::new(path).is_file())
+}
+
+unsafe fn pam_error(handle: &pam::PamHandle, msg: &str) {
+    let _ = pam_converse(handle, pam_ffi::PAM_ERROR_MSG, msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -149,115 +288,62 @@ unsafe fn pam_converse(
 pub struct MyKeyPinModule;
 
 impl PamModule for MyKeyPinModule {
-    /// Authenticate the user by verifying their MyKey PIN against the TPM2-sealed hash.
+    /// Authenticate the user by prompting for a PIN and dispatching helper verification.
     fn authenticate(
         handle: &pam::PamHandle,
         _args: Vec<&CStr>,
         _flags: c_uint,
     ) -> PamReturnCode {
-        // 1. Cooldown check.
-        if let Some(secs_remaining) = pin::is_locked_out() {
-            unsafe {
-                pam_converse(
-                    handle,
-                    pam_ffi::PAM_ERROR_MSG,
-                    &format!(
-                        "MyKey PIN locked. Try again in {} seconds.",
-                        secs_remaining
-                    ),
-                );
-            }
-            return PamReturnCode::Auth_Err;
-        }
-
-        // 2. Prompt for PIN via PAM conversation.
-        let entered_pin = unsafe {
-            match pam_converse(handle, pam_ffi::PAM_PROMPT_ECHO_OFF, "MyKey PIN: ") {
-                Some(p) => p,
-                None => return PamReturnCode::Auth_Err,
+        let username = unsafe {
+            match pam_user(handle) {
+                Some(user) => user,
+                None => {
+                    pam_error(handle, "Could not resolve the PAM target user.");
+                    return PamReturnCode::Auth_Err;
+                }
             }
         };
 
-        // 3. Ensure a PIN has been enrolled.
-        if !pin::pin_is_set() {
-            unsafe {
-                pam_converse(
-                    handle,
-                    pam_ffi::PAM_ERROR_MSG,
-                    "No MyKey PIN is set. Run: mykey-pin set",
-                );
-            }
-            return PamReturnCode::Auth_Err;
-        }
-
-        // 4. Read the sealed PIN hash from disk.
-        let sealed = match std::fs::read(pin::PIN_FILE) {
-            Ok(data) if !data.is_empty() => data,
-            _ => {
+        let uid = match user_to_uid(&username) {
+            Some(uid) => uid,
+            None => {
                 unsafe {
-                    pam_converse(
+                    pam_error(
                         handle,
-                        pam_ffi::PAM_ERROR_MSG,
-                        "Failed to read MyKey PIN data.",
+                        "Could not resolve the target account for MyKey PIN authentication.",
                     );
                 }
                 return PamReturnCode::Auth_Err;
             }
         };
 
-        // 5. Unseal the PIN hash via mykey-daemon over D-Bus.
-        let unsealed = {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(_) => return PamReturnCode::Auth_Err,
-            };
-
-            match rt.block_on(async {
-                let client = daemon_client::DaemonClient::connect().await?;
-                let result = client.unseal_secret(&sealed).await;
-                client.disconnect().await;
-                result
-            }) {
-                Ok(data) => data,
-                Err(_) => {
-                    unsafe {
-                        pam_converse(
-                            handle,
-                            pam_ffi::PAM_ERROR_MSG,
-                            "MyKey daemon error. Is mykey-daemon running?",
-                        );
-                    }
-                    return PamReturnCode::Auth_Err;
-                }
+        let entered_pin = unsafe {
+            match pam_converse(handle, pam_ffi::PAM_PROMPT_ECHO_OFF, "MyKey PIN: ") {
+                Some(pin) => Zeroizing::new(pin),
+                None => return PamReturnCode::Auth_Err,
             }
         };
 
-        // 6. Compare the hash of the entered PIN against the unsealed reference.
-        let entered_hash = pin::hash_pin(&entered_pin);
-        if entered_hash == unsealed {
-            pin::record_success();
-            PamReturnCode::Success
-        } else {
-            pin::record_failed_attempt();
-            let state = pin::read_attempts();
-            unsafe {
-                if state.failed_sessions >= pin::MAX_ATTEMPTS {
-                    pam_converse(
-                        handle,
-                        pam_ffi::PAM_ERROR_MSG,
-                        &format!(
-                            "Too many failed attempts. Locked for {} seconds.",
-                            pin::cooldown_secs(state.failed_sessions)
-                        ),
-                    );
-                } else {
-                    pam_converse(handle, pam_ffi::PAM_ERROR_MSG, "Incorrect MyKey PIN.");
+        match run_pin_helper_verify(uid, entered_pin.as_bytes()) {
+            HelperVerifyResult::Success => PamReturnCode::Success,
+            HelperVerifyResult::AuthFailed => {
+                unsafe {
+                    pam_error(handle, "Incorrect MyKey PIN.");
                 }
+                PamReturnCode::Auth_Err
             }
-            PamReturnCode::Auth_Err
+            HelperVerifyResult::Locked(msg)
+            | HelperVerifyResult::NotConfigured(msg)
+            | HelperVerifyResult::Error(msg) => {
+                unsafe {
+                    pam_error(handle, if msg.is_empty() {
+                        "MyKey PIN authentication failed."
+                    } else {
+                        &msg
+                    });
+                }
+                PamReturnCode::Auth_Err
+            }
         }
     }
 
