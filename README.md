@@ -1,228 +1,284 @@
 # MyKey
+
 <p align="center">
   <img src="assets/mykey-logo-stylized.png" width="500" alt="MyKey logo">
 </p>
 
----
-
-MyKey is a hardware-backed authentication and secret management platform for Linux.
-
-Built on TPM2, Secure Boot, and native Linux security components, MyKey brings together passwordless authentication, encrypted secret storage, biometrics, and browser integration into a single, simple experience.
-
-**Secure by design. Simple by default. Built for Linux.**
+<p align="center">
+  <strong>Windows Hello–style authentication for Linux.</strong><br>
+  Hardware-backed secrets, local authentication, and a cleaner security experience built around TPM2, Secure Boot, and native Linux tools.
+</p>
 
 ---
 
-## ✨ Features
+## 👋 What Is MyKey?
 
-- 🔐 TPM2-backed credential storage  
-- 🧠 Encrypted secret management  
-- 🗝️ Secret Service API provider (replacement for KWallet / gnome-keyring)  
-- 👆 Biometric authentication (fingerprint / face unlock)  
-- 🌐 WebAuthn support for Chromium and Firefox  
-- 📁 Secure file storage (encrypted folders)  
-- 🛡️ Guided Secure Boot setup  
+MyKey is a Linux security platform that brings authentication, secret storage, and secure local workflows together into one system.
+
+Instead of juggling separate tools for browser authentication, desktop keyrings, local unlock, and future PIN or biometric flows, MyKey is designed to make those pieces feel like one coherent experience.
+
+At a high level, MyKey aims to give Linux users:
+
+- 🔐 hardware-backed authentication
+- 🧠 TPM-sealed secret storage
+- 🗝️ a Secret Service provider
+- 🔄 a migration path from existing keyrings
+- 🌐 browser integration for WebAuthn
+- 🔢 a Windows Hello–style local PIN path
+
+**Simple to use. Serious about security. Built for Linux first.**
+
+---
+
+## ✨ Why MyKey?
+
+Linux already has strong security building blocks. The problem is that they are often split across different tools, desktop environments, and workflows.
+
+MyKey tries to make that experience feel more unified.
+
+The goal is not to hide how security works. The goal is to make the important parts easier to use without turning them into mystery boxes.
+
+If Windows Hello made local authentication feel modern and straightforward, MyKey is trying to bring that same spirit to Linux using open tools and real hardware protections.
 
 ---
 
 ## 🧩 Components
 
-MyKey is made up of several components that work together:
+MyKey is made up of focused modules that work together.
 
-- ⚙️ **Daemon (`mykey-daemon`)**  
-  Core background service handling authentication, TPM interaction, and security logic  
+### ⚙️ `mykey-daemon`
+The security core of the project.
 
-- 🎛️ **GUI Manager (`mykey-manager`)**  
-  Desktop app for managing credentials, secrets, biometrics, and system security  
+It handles:
+- TPM interaction
+- authentication decisions
+- caller validation
+- secure policy checks
+- privileged operations used by the rest of MyKey
 
-- 🖥️ **System Tray (`mykey-tray`)**  
-  System tray interface for status and quick actions  
+### 🔌 `mykey-host`
+The native messaging host that connects the browser extension to the local system.
 
-- 🗝️ **Secret Service API (`mykey-secrets`)**  
-  Secret Service API provider — a hardware-backed, desktop-agnostic replacement for KWallet and gnome-keyring  
+### 🌐 `mykey-proxy`
+The browser extension used for WebAuthn flows.
 
-- 🔄 **Migration Tool (`mykey-migrate`)**  
-  Bidirectional migration utility for securely transferring secrets between MyKey and other Secret Service providers
+### 🖥️ `mykey-tray`
+A tray app for status and quick interaction.
 
-- 🔌 **Native Host (`mykey-host`)**  
-  Native messaging bridge between the browser and the system  
+### 🗝️ `mykey-secrets`
+A Secret Service provider backed by MyKey’s hardware-focused design.
 
-- 🌐 **Browser Extension (`mykey-proxy`)**  
-  Browser extension that enables WebAuthn authentication on Linux  
+This is intended to act as a secure alternative to traditional software-only keyring providers.
 
-- 📦 **Distribution**  
-  Planned for AUR (Arch Linux) with potential Flatpak support later  
+### 🔄 `mykey-migrate`
+A migration tool that can move secrets between MyKey and existing Secret Service providers such as GNOME Keyring, KWallet, and KeePassXC.
 
----
+### 🔢 `mykey-pin`
+An optional local PIN-based authentication path.
 
-## 🤔 Why MyKey?
+The long-term goal is a Windows Hello–style local authenticator for Linux:
+- device-local
+- optional
+- TPM-aware
+- separate from the user’s Unix password
 
-Linux has powerful security tools — but they’re often fragmented, inconsistent, or difficult to use.
-
-MyKey brings them together into one system:
-
-- No passwords to remember  
-- No juggling multiple tools  
-- No guessing how your system is secured  
-
-Just fast, secure authentication and encrypted storage — built directly on your system.
-
-> Windows Hello–style authentication for Linux, built on open standards and real hardware security.
-
----
-
-## ⚙️ How It Works
-
-When authentication or secure data access is needed, MyKey handles everything locally:
-
-1. 👆 **You verify your identity**  
-   Using biometrics or your system credentials  
-
-2. 🔐 **Your system validates securely**  
-   TPM2 ensures keys never leave your machine  
-
-3. ✅ **Access is granted safely**  
-   Whether it's logging in, unlocking data, or approving a request  
-
-Everything happens on your machine:
-- No cloud dependency  
-- No passwords sent over the network  
-- No hidden background services  
-
-**One system. One identity. Fully under your control.**
+### 🎛️ `mykey-manager`
+A planned GUI frontend for managing MyKey features from one place.
 
 ---
 
-## 🖥️ Supported Platform
+## 🛡️ Security Model
 
-MyKey is designed for a **specific, security-focused Linux environment**.
+MyKey is designed around a few clear ideas.
 
-### 🔐 Required Hardware
+### Hardware should matter
+Secrets and security-sensitive operations should be tied to the machine through TPM2 wherever possible.
 
-- TPM 2.0  
-- UEFI firmware  
-- Secure Boot enabled  
+### Local authentication should stay local
+MyKey PIN is meant to be a local device authenticator, not a network password and not something that should leave the machine.
 
-### ⚙️ Required System Stack
+### Boot trust matters
+MyKey relies on a known-good boot chain. That is why Secure Boot, TPM measurements, and predictable boot configuration are part of the design.
 
-- systemd  
-- systemd-boot  
-- sbctl  
-- UKI (Unified Kernel Image)  
-- PAM  
-- D-Bus  
-- polkit  
-- `/boot/EFI/` partition layout  
+### Convenience and recovery are not the same thing
+Convenient daily authentication and elevated security actions are different categories.
 
-> ⚠️ MyKey relies on TPM PCR measurements tied to your boot process.  
-> To guarantee security, the boot chain must be predictable and verifiable.  
-> Unsupported configurations will cause sealed credentials to fail to unlock.
+MyKey is moving toward this model:
+- 👆 normal local auth: biometrics or MyKey PIN
+- 🔐 elevated actions: stronger verification for setup, reset, and recovery flows
 
 ---
 
-## ⚠️ Disclaimer
+## 🖥️ Supported System
 
-MyKey is an experimental project developed as part of a cybersecurity learning project.
+MyKey is intentionally opinionated.
 
-This project:
-- has **not been formally audited**
-- is **still in active development**
-- is **not recommended for production use**
+It is currently designed for a security-focused Linux setup with:
 
-Use at your own risk.
+### 🔩 Required hardware
+- TPM 2.0
+- UEFI firmware
+- Secure Boot enabled
 
-Hardware-backed authentication is serious — review and understand the system before relying on it.
+### ⚙️ Required system stack
+- systemd
+- systemd-boot
+- sbctl
+- UKI-based boot flow
+- PAM
+- D-Bus
+- polkit
 
-Parts of this project were developed with the assistance of AI tools.  
-All design decisions and implementations were reviewed and directed by a human.
+### ❗ Why the requirements are strict
+MyKey seals data against platform state. That only works reliably when the boot chain and local trust model are predictable.
 
-If you discover a security issue, please report it responsibly.
-
----
-
-## 🗺️ Project Roadmap
-
-### ✅ Complete
-
-- WebAuthn authentication via Chromium extension (`mykey-proxy`)
-- Native host (`mykey-host`), daemon (`mykey-daemon`), and system tray (`mykey-tray`) architecture  
-- Encrypted IPC (AES-256-GCM + HMAC + replay protection)  
-- TPM2 key sealing with PCR 0+7 binding
-- Polkit authentication with brute-force protection  
-- Process verification and binary integrity checks  
-- Hardened systemd service  
-- Secure Boot validation at startup  
-- Bidirectional Secret Service provider migration (`mykey-migrate`)
-- Secret Service API (`mykey-secrets`) 
+If the platform configuration drifts too far from the expected model, sealed data may fail to unlock. That is not a bug in the security model. That is part of how the protection works.
 
 ---
 
-### 🚧 In Progress
+## 🚧 Current Project Status
 
-- GTK4 Desktop Manager (`mykey-manager`)
-- PAM PIN module (`mykeypin.so`)
+MyKey is in active development and moving toward its first release.
+
+The core platform is no longer just an idea. Several major pieces are already working together, including TPM-backed operations, browser integration, Secret Service support, and secret migration.
+
+### ✅ What is working now
+- TPM-backed daemon and native host architecture
+- WebAuthn flow through Chromium-based browsers
+- Secret Service provider support through `mykey-secrets`
+- bidirectional secret migration with `mykey-migrate`
+- Secure Boot and platform prerequisite validation in the installer
+- per-user MyKey PIN foundation with daemon-backed verification
+- PAM-backed MyKey PIN authentication flow
+- strong-auth gating for PIN setup and reset
+
+### 🛠️ What is being finished now
+These are the main items still being refined before MyKey feels ready for a first public release:
+
+- final `mykey-pin` policy and user experience
+- biometric-first local authentication with PIN fallback
+- cleanup of remaining brute-force behavior so it only affects MyKey PIN flows
+- packaging and release polish
+- clearer documentation for setup, fallback, and supported system requirements
+- continued work on `mykey-manager`
+
+### 📌 What this means today
+MyKey already has real working subsystems, but the project is still in the release-hardening phase.
+
+It is best described as:
+- functional in important areas
+- still evolving in policy and UX
+- not yet production-ready
 
 ---
 
-### 📦 Planned (Near Term)
+## 🗺️ Roadmap
 
-- Chrome Web Store submission for (`mykey-proxy`)
-- AUR package  
+The roadmap is about where MyKey goes after the current release-hardening work is finished.
 
----
+### 📦 Near-term
+These are the first-release and shortly-after-release goals:
 
-### 🚀 Future
+- complete `mykey-manager`
+- finalize MyKey PIN policy and local auth behavior
+- add biometric-first local auth using supported Linux biometric frontends
+- improve packaging and installation experience
+- publish clearer user-facing documentation
+- prepare AUR packaging
 
-- WebAuthn authentication via Firefox extension (`mykey-proxy`) **
-- Firefox Add-ons submission (Pending Firefox support)
-- Flatpak distribution  
-- Mobile companion app  
+### 🔧 Mid-term
+These are the next meaningful platform improvements after the first release is stable:
 
-> ** Firefox does not currently support the platform authenticator proxy API required for WebAuthn integration. Firefox support is on hold until Mozilla implements this capability.
+- expand recovery options for MyKey PIN
+- explore optional TOTP-based recovery flows
+- improve onboarding and management through the GUI
+- refine desktop integration and service management
+- continue hardening and validation across supported environments
+
+### 🚀 Long-term
+These are the bigger platform goals that move MyKey closer to a full Windows Hello–style Linux experience:
+
+- evolve MyKey PIN beyond the current sealed-verifier model toward a stronger TPM-backed local auth design
+- broaden supported authentication flows while keeping them local and hardware-aware
+- improve distribution options beyond source install
+- revisit Firefox support if browser platform support becomes practical
+- continue building toward a more complete Linux authentication platform, not just a collection of tools
+
 ---
 
 ## 📥 Installation
 
 ```bash
 git clone https://github.com/JamesFromFL/mykey
-cd mykey-proxy
+cd mykey
 ./scripts/install.sh
 ```
-Follow the on-screen prompts — the installer handles:
 
-- TPM checks
+The installer currently handles:
+- TPM validation
 - Secure Boot validation
-- extension setup
-- system configuration
+- signed boot file checks
+- build and install steps
+- MyKey secret migration
+- browser extension setup
+- final health checks
 
-> ⚠️ Installation is under active development and may change.
+> ⚠️ The installer is still evolving. Expect some changes while the first release is being prepared.
 
 ---
 
 ## 🗑️ Uninstall
 
 ```bash
-git clone https://github.com/JamesFromFL/mykey
-cd mykey-proxy
-sudo ./scripts/uninstall.sh
+./scripts/uninstall.sh
 ```
-> Removes all installed MyKey components from the system.
+
+This removes the installed MyKey components and restores your previous Secret Service setup when applicable.
 
 ---
 
 ## 🧪 Testing
 
-Current testing focuses on WebAuthn functionality via the browser extension.
+Current real-world testing has focused on:
 
-### WebAuthn
-- Visit https://webauthn.io
-- Register a credential
-- Authenticate using your Linux credentials
+### 🌐 WebAuthn
+- Chromium-based browser flows
+- registration and sign-in testing
 
-### Compatibility
-- NordPass (v7.5.7) — biometric unlock confirmed working via polkit
+### 🗝️ Secret management
+- migration to and from GNOME Keyring
+- KWallet and KeePassXC readiness handling
 
-> ⚠️ Testing is currently limited and will expand over time.
+### 🔢 Local authentication
+- daemon-backed MyKey PIN flows
+- helper-backed PAM authentication
+- strong-auth gating for setup and reset actions
+
+Testing coverage is improving, but this is still an active project and not a completed security product.
+
+---
+
+## ⚠️ Important Warning
+
+MyKey is experimental software.
+
+That means:
+
+- it has not been formally audited
+- it is still changing quickly
+- it should not be treated as production-ready security software yet
+
+If you use it, do so carefully and with the understanding that the project is still being hardened.
+
+If you find a security issue, please report it responsibly.
+
+---
+
+## 🤖 AI Disclosure
+
+Parts of this project were developed with the help of AI tools.
+
+Architecture direction, review, validation, and final decisions remain human-driven.
 
 ---
 
