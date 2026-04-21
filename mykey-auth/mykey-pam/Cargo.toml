@@ -1,0 +1,24 @@
+[package]
+name = "mykey-auth"
+version = "0.1.0"
+edition = "2021"
+description = "Unified local authentication helper and PAM module for MyKey"
+license = "MIT"
+
+[[bin]]
+name = "mykey-auth"
+path = "src/bin/mykey-auth.rs"
+
+[lib]
+name = "pam_mykey"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+pam = { version = "0.8", features = ["module"] }
+zbus = { version = "4", features = ["tokio"] }
+tokio = { version = "1", features = ["full"] }
+zeroize = { version = "1", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"

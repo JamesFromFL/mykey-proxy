@@ -431,14 +431,18 @@ TRAY_BINARY="mykey-tray"
 SECRETS_BINARY="mykey-secrets"
 PIN_BINARY="mykey-pin"
 PIN_HELPER_BINARY="mykey-pin-auth"
+AUTH_BINARY="mykey-auth"
 HOST_DEST="/usr/local/bin/${HOST_BINARY}"
 DAEMON_DEST="/usr/local/bin/${DAEMON_BINARY}"
 TRAY_DEST="/usr/local/bin/${TRAY_BINARY}"
 SECRETS_DEST="/usr/local/bin/${SECRETS_BINARY}"
 PIN_DEST="/usr/local/bin/mykey-pin"
 PIN_HELPER_DEST="/usr/local/bin/mykey-pin-auth"
+AUTH_DEST="/usr/local/bin/${AUTH_BINARY}"
 PIN_SO_DEST="/usr/lib/security/mykeypin.so"
+AUTH_SO_DEST="/usr/lib/security/pam_mykey.so"
 PIN_DIR="/etc/mykey/pin"
+LOCAL_AUTH_DIR="/etc/mykey/auth"
 HOST_MANIFEST_SRC="${REPO_ROOT}/scripts/com.mykey.host.json"
 SYSTEMD_UNIT_SRC="${REPO_ROOT}/scripts/mykey-daemon.service"
 TRAY_SERVICE_SRC="${REPO_ROOT}/scripts/mykey-tray.service"
@@ -511,6 +515,7 @@ sudo install -d -m 0700 -o "${REAL_USER}" "${WEBAUTHN_DIR}/secrets"
 sudo install -d -m 0700 -o "${REAL_USER}" "${WEBAUTHN_DIR}/secrets/default"
 sudo install -d -m 0700 -o "${REAL_USER}" "${WEBAUTHN_DIR}/provider"
 sudo install -d -m 0700 -o "${DAEMON_USER}" "${PIN_DIR}"
+sudo install -d -m 0700 -o "${DAEMON_USER}" "${LOCAL_AUTH_DIR}"
 # Restore /etc/mykey — 711 allows traversal by the real user without exposing listings
 sudo chmod 711 "${WEBAUTHN_DIR}"
 ok "Directories ready."
@@ -651,24 +656,41 @@ ok "/usr/local/bin/mykey-migrate"
 # ── 4.21 Build mykey-pin ─────────────────────────────────────────────────
 echo ""
 info "Building mykey-pin (release)..."
-cd "${REPO_ROOT}/mykey-pin"
+cd "${REPO_ROOT}/mykey-auth/mykey-pin"
 RUSTFLAGS="-A warnings" "${CARGO}" build --release
 ok "Build complete: mykey-pin"
 
 # ── 4.22 Install mykey-pin binary ────────────────────────────────────────
-sudo install -m 0755 "${REPO_ROOT}/mykey-pin/target/release/mykey-pin" \
+sudo install -m 0755 "${REPO_ROOT}/mykey-auth/mykey-pin/target/release/mykey-pin" \
     "${PIN_DEST}"
 ok "${PIN_DEST}"
 
 # ── 4.23 Install mykey-pin-auth helper ────────────────────────────────────
-sudo install -m 0755 "${REPO_ROOT}/mykey-pin/target/release/${PIN_HELPER_BINARY}" \
+sudo install -m 0755 "${REPO_ROOT}/mykey-auth/mykey-pin/target/release/${PIN_HELPER_BINARY}" \
     "${PIN_HELPER_DEST}"
 ok "${PIN_HELPER_DEST}"
 
 # ── 4.24 Install mykeypin.so PAM module ──────────────────────────────────
-sudo install -m 0755 "${REPO_ROOT}/mykey-pin/target/release/libmykeypin.so" \
+sudo install -m 0755 "${REPO_ROOT}/mykey-auth/mykey-pin/target/release/libmykeypin.so" \
     "${PIN_SO_DEST}"
 ok "${PIN_SO_DEST}"
+
+# ── 4.25 Build mykey-auth ────────────────────────────────────────────────
+echo ""
+info "Building ${AUTH_BINARY} (release)..."
+cd "${REPO_ROOT}/mykey-auth/mykey-pam"
+RUSTFLAGS="-A warnings" "${CARGO}" build --release
+ok "Build complete: ${AUTH_BINARY}"
+
+# ── 4.26 Install mykey-auth binary ───────────────────────────────────────
+sudo install -m 0755 "${REPO_ROOT}/mykey-auth/mykey-pam/target/release/${AUTH_BINARY}" \
+    "${AUTH_DEST}"
+ok "${AUTH_DEST}"
+
+# ── 4.27 Install pam_mykey.so PAM module ─────────────────────────────────
+sudo install -m 0755 "${REPO_ROOT}/mykey-auth/mykey-pam/target/release/libpam_mykey.so" \
+    "${AUTH_SO_DEST}"
+ok "${AUTH_SO_DEST}"
 
 # Update binary hashes after installation
 echo ""
@@ -908,7 +930,7 @@ fi
 
 # [3/9] Binaries
 echo "[3/9] Binaries..."
-for bin in "${HOST_BINARY}" "${DAEMON_BINARY}" "${TRAY_BINARY}" "${SECRETS_BINARY}" "mykey-migrate" "${PIN_BINARY}" "${PIN_HELPER_BINARY}"; do
+for bin in "${HOST_BINARY}" "${DAEMON_BINARY}" "${TRAY_BINARY}" "${SECRETS_BINARY}" "mykey-migrate" "${PIN_BINARY}" "${PIN_HELPER_BINARY}" "${AUTH_BINARY}"; do
     if [[ -x "/usr/local/bin/${bin}" ]]; then
         ok "/usr/local/bin/${bin}"
     else
@@ -922,7 +944,9 @@ echo "[4/9] Configuration..."
 for f in \
     "${TRUSTED_HASHES}" \
     "${POLKIT_POLICY}" \
-    "/etc/dbus-1/system.d/com.mykey.Daemon.conf"
+    "/etc/dbus-1/system.d/com.mykey.Daemon.conf" \
+    "${PIN_SO_DEST}" \
+    "${AUTH_SO_DEST}"
 do
     if sudo test -f "${f}"; then
         ok "${f}"

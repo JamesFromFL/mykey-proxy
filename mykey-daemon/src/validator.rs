@@ -157,6 +157,7 @@ const TRUSTED_MYKEY_BINARIES: &[&str] = &[
     "mykey-manager",
     "mykey-pin",
     "mykey-pin-auth",
+    "mykey-auth",
 ];
 
 fn is_valid_mykey_program(program: &str) -> bool {

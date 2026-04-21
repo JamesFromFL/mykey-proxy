@@ -31,6 +31,20 @@ fn print_usage() {
     println!("mykey-pin status   Show PIN and lockout status");
 }
 
+fn validate_new_pin(pin: &str) -> Result<(), &'static str> {
+    let len = pin.len();
+    if len < 4 {
+        return Err("PIN must be at least 4 digits.");
+    }
+    if len > 12 {
+        return Err("PIN must be no more than 12 digits.");
+    }
+    if !pin.as_bytes().iter().all(|b| b.is_ascii_digit()) {
+        return Err("PIN must contain digits only.");
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // set
 // ---------------------------------------------------------------------------
@@ -196,6 +210,11 @@ async fn enroll_new_pin(client: &daemon_client::DaemonClient, uid: u32) {
         std::process::exit(1);
     }
 
+    if let Err(msg) = validate_new_pin(new_pin.as_str()) {
+        eprintln!("{msg}");
+        std::process::exit(1);
+    }
+
     if let Err(e) = client.pin_enroll(uid, new_pin.as_bytes()).await {
         eprintln!("Failed to enroll MyKey PIN: {e}");
         std::process::exit(1);
@@ -232,6 +251,11 @@ async fn set_existing_pin(client: &daemon_client::DaemonClient, uid: u32) {
         std::process::exit(1);
     }
 
+    if let Err(msg) = validate_new_pin(new_pin.as_str()) {
+        eprintln!("{msg}");
+        std::process::exit(1);
+    }
+
     match client
         .pin_change(uid, current_pin.as_bytes(), new_pin.as_bytes())
         .await
@@ -253,4 +277,33 @@ async fn set_existing_pin(client: &daemon_client::DaemonClient, uid: u32) {
 /// Prompt for a PIN with no terminal echo.  Returns `None` on I/O error.
 fn prompt_pin(prompt: &str) -> Option<Zeroizing<String>> {
     rpassword::prompt_password(prompt).ok().map(Zeroizing::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_new_pin;
+
+    #[test]
+    fn pin_policy_accepts_numeric_lengths_in_range() {
+        assert!(validate_new_pin("1234").is_ok());
+        assert!(validate_new_pin("123456789012").is_ok());
+    }
+
+    #[test]
+    fn pin_policy_rejects_short_long_or_non_numeric_values() {
+        assert_eq!(validate_new_pin(""), Err("PIN must be at least 4 digits."));
+        assert_eq!(validate_new_pin("123"), Err("PIN must be at least 4 digits."));
+        assert_eq!(
+            validate_new_pin("1234567890123"),
+            Err("PIN must be no more than 12 digits.")
+        );
+        assert_eq!(
+            validate_new_pin("12ab"),
+            Err("PIN must contain digits only.")
+        );
+        assert_eq!(
+            validate_new_pin("12 4"),
+            Err("PIN must contain digits only.")
+        );
+    }
 }

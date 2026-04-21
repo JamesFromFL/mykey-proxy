@@ -22,6 +22,7 @@ use zbus::{message::Header, Connection};
 
 use crate::authentication;
 use crate::crypto;
+use crate::local_auth_policy::{LocalAuthMethod, LocalAuthPolicyStore};
 use crate::pam;
 use crate::pin_store::PinStore;
 use crate::protocol::{CreateRequest, GetRequest};
@@ -40,6 +41,7 @@ pub struct DaemonState {
     pub sessions:     SessionStore,
     pub replay_cache: AsyncReplayCache,
     pub pin_store:    PinStore,
+    pub local_auth_policy_store: LocalAuthPolicyStore,
 }
 
 impl DaemonState {
@@ -48,6 +50,7 @@ impl DaemonState {
             sessions:     SessionStore::new(),
             replay_cache: AsyncReplayCache::new(),
             pin_store:    PinStore::default(),
+            local_auth_policy_store: LocalAuthPolicyStore::default(),
         }
     }
 }
@@ -322,6 +325,24 @@ impl DaemonInterface {
         self.pin_status_for_uid(target_uid)
     }
 
+    // ── LocalAuthStatus ──────────────────────────────────────────────────────
+    /// Return local-auth policy state for `target_uid`.
+    ///
+    /// Tuple layout:
+    ///   `(enabled, primary_method, pin_fallback_enabled, biometric_backend)`
+    async fn local_auth_status(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(bool, String, bool, String), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_pin_call(conn, &header, pid, target_uid)
+            .await?;
+        self.local_auth_status_for_uid(target_uid)
+    }
+
     // ── PinEnroll ────────────────────────────────────────────────────────────
     /// Enroll a new PIN for `target_uid`.
     ///
@@ -519,7 +540,10 @@ impl DaemonInterface {
 
     fn ensure_pin_api_caller(&self, identity: &CallerIdentity) -> Result<(), zbus::fdo::Error> {
         match identity.mykey_program {
-            Some("mykey-pin") | Some("mykey-pin-auth") | Some("mykey-manager") => Ok(()),
+            Some("mykey-pin")
+            | Some("mykey-pin-auth")
+            | Some("mykey-manager")
+            | Some("mykey-auth") => Ok(()),
             Some(other) => Err(zbus::fdo::Error::AccessDenied(format!(
                 "PIN APIs are not available to {other}"
             ))),
@@ -580,6 +604,26 @@ impl DaemonInterface {
         Ok((is_set, cooldown_remaining, attempts.failed_sessions))
     }
 
+    fn validate_new_pin(pin: &[u8]) -> Result<(), zbus::fdo::Error> {
+        let len = pin.len();
+        if len < 4 {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "PIN must be at least 4 digits.".to_string(),
+            ));
+        }
+        if len > 12 {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "PIN must be no more than 12 digits.".to_string(),
+            ));
+        }
+        if !pin.iter().all(u8::is_ascii_digit) {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "PIN must contain digits only.".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn pin_enroll_for_uid(&self, uid: u32, pin: Vec<u8>) -> Result<(), zbus::fdo::Error> {
         if self
             .state
@@ -591,6 +635,8 @@ impl DaemonInterface {
                 "A MyKey PIN is already set for uid={uid}"
             )));
         }
+
+        Self::validate_new_pin(&pin)?;
 
         let pin = Zeroizing::new(pin);
         let pin_hash = Zeroizing::new(hash_pin_bytes(pin.as_slice()));
@@ -604,6 +650,10 @@ impl DaemonInterface {
             .pin_store
             .record_success(uid)
             .map_err(|e| zbus::fdo::Error::Failed(format!("PIN attempts reset failed: {e}")))?;
+        self.state
+            .local_auth_policy_store
+            .enable_pin_only(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Local auth policy update failed: {e}")))?;
         Ok(())
     }
 
@@ -665,6 +715,8 @@ impl DaemonInterface {
             return Ok(false);
         }
 
+        Self::validate_new_pin(&new_pin)?;
+
         let new_pin = Zeroizing::new(new_pin);
         let pin_hash = Zeroizing::new(hash_pin_bytes(new_pin.as_slice()));
         let sealed = tpm::seal_blob(pin_hash.as_slice())
@@ -684,7 +736,66 @@ impl DaemonInterface {
         self.state
             .pin_store
             .clear_pin(uid)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN reset failed: {e}")))
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN reset failed: {e}")))?;
+        self.state
+            .local_auth_policy_store
+            .on_pin_reset(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Local auth policy update failed: {e}")))?;
+        Ok(())
+    }
+
+    fn local_auth_status_for_uid(
+        &self,
+        uid: u32,
+    ) -> Result<(bool, String, bool, String), zbus::fdo::Error> {
+        let mut policy = self
+            .state
+            .local_auth_policy_store
+            .repair_policy(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Local auth policy read failed: {e}")))?;
+
+        // Backfill existing pin-only deployments that predate daemon-owned
+        // local-auth policy. If a PIN exists and no explicit policy has been
+        // written yet, treat that as enabled pin-only local auth and persist it.
+        if !policy.enabled
+            && policy.primary_method == LocalAuthMethod::Pin
+            && !policy.pin_fallback_enabled
+            && policy.biometric_backend.is_none()
+            && self
+                .state
+                .pin_store
+                .pin_is_set(uid)
+                .map_err(|e| zbus::fdo::Error::Failed(format!("PIN status failed: {e}")))?
+        {
+            self.state
+                .local_auth_policy_store
+                .enable_pin_only(uid)
+                .map_err(|e| {
+                    zbus::fdo::Error::Failed(format!(
+                        "Local auth policy backfill failed: {e}"
+                    ))
+                })?;
+            policy = self
+                .state
+                .local_auth_policy_store
+                .repair_policy(uid)
+                .map_err(|e| {
+                    zbus::fdo::Error::Failed(format!(
+                        "Local auth policy read failed after backfill: {e}"
+                    ))
+                })?;
+        }
+
+        let biometric_backend = policy
+            .biometric_backend
+            .map(|backend| backend.as_str().to_string())
+            .unwrap_or_default();
+        Ok((
+            policy.enabled,
+            policy.primary_method.as_str().to_string(),
+            policy.pin_fallback_enabled,
+            biometric_backend,
+        ))
     }
 
     /// Decrypt `ciphertext` (JSON-serialised EncryptedPayload) using the
@@ -764,17 +875,30 @@ struct RequestEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::local_auth_policy::LocalAuthPolicyStore;
     use crate::replay::AsyncReplayCache;
     use crate::session::SessionStore;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_test_root(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
 
     fn test_interface() -> DaemonInterface {
         DaemonInterface::new(Arc::new(DaemonState {
             sessions: SessionStore::new(),
             replay_cache: AsyncReplayCache::new(),
-            pin_store: PinStore::new(std::env::temp_dir().join(format!(
-                "mykey-dbus-pin-test-{}",
-                std::process::id()
-            ))),
+            pin_store: PinStore::new(unique_test_root("mykey-dbus-pin-test")),
+            local_auth_policy_store: LocalAuthPolicyStore::new(unique_test_root(
+                "mykey-dbus-local-auth-test",
+            )),
         }))
     }
 
@@ -794,6 +918,9 @@ mod tests {
             .is_ok());
         assert!(interface
             .ensure_pin_api_caller(&identity(1000, Some("mykey-manager")))
+            .is_ok());
+        assert!(interface
+            .ensure_pin_api_caller(&identity(1000, Some("mykey-auth")))
             .is_ok());
 
         assert!(interface
@@ -839,5 +966,59 @@ mod tests {
         assert!(interface
             .ensure_pin_management_caller(&identity(1000, None))
             .is_err());
+    }
+
+    #[test]
+    fn pin_policy_accepts_only_numeric_values_in_range() {
+        assert!(DaemonInterface::validate_new_pin(b"1234").is_ok());
+        assert!(DaemonInterface::validate_new_pin(b"123456789012").is_ok());
+
+        assert!(DaemonInterface::validate_new_pin(b"123").is_err());
+        assert!(DaemonInterface::validate_new_pin(b"1234567890123").is_err());
+        assert!(DaemonInterface::validate_new_pin(b"12ab").is_err());
+        assert!(DaemonInterface::validate_new_pin(b"12 4").is_err());
+    }
+
+    #[test]
+    fn local_auth_status_backfills_existing_pin_only_state() {
+        let interface = test_interface();
+        interface
+            .state
+            .pin_store
+            .write_pin_blob(1000, b"dummy-sealed-pin")
+            .expect("write dummy pin blob");
+
+        let status = interface
+            .local_auth_status_for_uid(1000)
+            .expect("read local auth status");
+
+        assert_eq!(status, (true, "pin".to_string(), true, String::new()));
+    }
+
+    #[test]
+    fn local_auth_status_repairs_invalid_biometric_policy() {
+        let interface = test_interface();
+        let policy_path = interface
+            .state
+            .local_auth_policy_store
+            .policy_path_for_test(1000);
+        std::fs::create_dir_all(policy_path.parent().expect("policy parent"))
+            .expect("create policy parent");
+        std::fs::write(
+            &policy_path,
+            r#"{
+  "enabled": true,
+  "primary_method": "biometric",
+  "pin_fallback_enabled": false,
+  "biometric_backend": "fprintd"
+}"#,
+        )
+        .expect("write invalid policy");
+
+        let status = interface
+            .local_auth_status_for_uid(1000)
+            .expect("read local auth status");
+
+        assert_eq!(status, (false, "pin".to_string(), false, String::new()));
     }
 }

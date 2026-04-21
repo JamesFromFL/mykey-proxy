@@ -15,6 +15,7 @@ mod credentials;
 mod crypto;
 mod crypto_ops;
 mod dbus_interface;
+mod local_auth_policy;
 mod pam;
 mod pin_store;
 mod prereqs;

@@ -46,6 +46,9 @@ If Windows Hello made local authentication feel modern and straightforward, MyKe
 
 MyKey is made up of focused modules that work together.
 
+The local-auth pieces are now grouped under the `mykey-auth/` subtree so the
+repo layout stays readable as PIN, PAM, and biometric support grow.
+
 ### ⚙️ `mykey-daemon`
 The security core of the project.
 
@@ -81,6 +84,14 @@ The long-term goal is a Windows Hello–style local authenticator for Linux:
 - optional
 - TPM-aware
 - separate from the user’s Unix password
+
+### 🧩 `mykey-auth`
+The local-auth subtree that groups MyKey’s system authentication pieces.
+
+It currently contains:
+- `mykey-pam` for the PAM-facing local auth layer
+- `mykey-pin` for PIN management and fallback auth
+- `mykey-biometrics` as the planned home for biometric setup and policy
 
 ### 🎛️ `mykey-manager`
 A planned GUI frontend for managing MyKey features from one place.

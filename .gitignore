@@ -1,3 +1,2 @@
-manager/target/
-manager/target/
-*/target/
+**/target/
+.codex
