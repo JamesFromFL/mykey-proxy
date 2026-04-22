@@ -1,39 +1,139 @@
-// main.rs — MyKey system tray application entry point.
-
+mod status;
 mod tray;
 
-use log::info;
+use std::time::Duration;
+
+use log::{error, info};
+
+use crate::status::StatusSnapshot;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Run,
+    Enable,
+    Disable,
+    Status,
+}
 
 fn setup_logger() {
-    let log_file = std::fs::OpenOptions::new()
+    let Some(log_path) = std::env::var_os("MYKEY_TRAY_LOG") else {
+        return;
+    };
+
+    let Ok(log_file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/mykey-tray.log")
-        .expect("Failed to open /tmp/mykey-tray.log");
+        .open(log_path)
+    else {
+        return;
+    };
 
-    env_logger::Builder::new()
+    let mut builder = env_logger::Builder::new();
+    builder
         .target(env_logger::Target::Pipe(Box::new(log_file)))
         .filter_level(log::LevelFilter::Debug)
-        .format_timestamp_secs()
-        .init();
+        .format_timestamp_secs();
+    let _ = builder.try_init();
+}
+
+fn parse_command() -> Result<Command, String> {
+    let mut args = std::env::args().skip(1);
+    let Some(arg) = args.next() else {
+        return Ok(Command::Run);
+    };
+
+    if args.next().is_some() {
+        return Err("Too many arguments.".into());
+    }
+
+    match arg.as_str() {
+        "run" => Ok(Command::Run),
+        "enable" => Ok(Command::Enable),
+        "disable" => Ok(Command::Disable),
+        "status" => Ok(Command::Status),
+        other => Err(format!("Unknown command: {other}")),
+    }
+}
+
+fn print_usage() {
+    eprintln!("Usage: mykey-tray [run|enable|disable|status]");
+}
+
+fn print_status(snapshot: &StatusSnapshot) {
+    for line in snapshot.lines() {
+        println!("{line}");
+    }
+}
+
+fn run_tray() -> Result<(), String> {
+    let initial = StatusSnapshot::gather();
+    if !initial.daemon_is_active() {
+        info!("mykey-daemon is not active; skipping tray startup");
+        return Ok(());
+    }
+
+    let service = ksni::TrayService::new(tray::MyKeyTray::new(initial.clone()));
+    let handle = service.handle();
+
+    std::thread::spawn(move || {
+        let mut last_snapshot = initial;
+        loop {
+            std::thread::sleep(Duration::from_secs(5));
+            let next_snapshot = StatusSnapshot::gather();
+            if next_snapshot != last_snapshot {
+                let snapshot_for_tray = next_snapshot.clone();
+                handle.update(|tray| tray.set_snapshot(snapshot_for_tray));
+                last_snapshot = next_snapshot;
+            }
+            if !last_snapshot.daemon_is_active() {
+                info!("mykey-daemon is no longer active; shutting down tray");
+                handle.shutdown();
+                break;
+            }
+        }
+    });
+
+    service
+        .run()
+        .map_err(|e| format!("mykey-tray failed to start: {e}"))
 }
 
 fn main() {
-    setup_logger();
-    info!(
-        "mykey-tray started (pid={}, version={})",
-        std::process::id(),
-        env!("CARGO_PKG_VERSION")
-    );
+    let command = parse_command().unwrap_or_else(|msg| {
+        eprintln!("{msg}");
+        print_usage();
+        std::process::exit(2);
+    });
 
-    let service = ksni::TrayService::new(tray::WebAuthnTray::new());
-    service.spawn();
+    match command {
+        Command::Enable => {
+            if let Err(e) = status::enable_tray() {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Disable => {
+            if let Err(e) = status::disable_tray() {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        Command::Status => {
+            print_status(&StatusSnapshot::gather());
+        }
+        Command::Run => {
+            setup_logger();
+            info!(
+                "mykey-tray started (pid={}, version={})",
+                std::process::id(),
+                env!("CARGO_PKG_VERSION")
+            );
 
-    info!("[tray] Tray service spawned, entering idle loop");
-
-    // Park the main thread — the tray runs on its own D-Bus thread.
-    // SIGTERM / Quit menu item will call process::exit directly.
-    loop {
-        std::thread::park();
+            if let Err(e) = run_tray() {
+                error!("{e}");
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
     }
 }

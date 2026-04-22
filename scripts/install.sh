@@ -425,14 +425,12 @@ echo "════════════════════════�
 echo " Phase 4 — Build and Install"
 echo "════════════════════════════════════════════════════════════"
 
-HOST_BINARY="mykey-host"
 DAEMON_BINARY="mykey-daemon"
 TRAY_BINARY="mykey-tray"
 SECRETS_BINARY="mykey-secrets"
 PIN_BINARY="mykey-pin"
 PIN_HELPER_BINARY="mykey-pin-auth"
 AUTH_BINARY="mykey-auth"
-HOST_DEST="/usr/local/bin/${HOST_BINARY}"
 DAEMON_DEST="/usr/local/bin/${DAEMON_BINARY}"
 TRAY_DEST="/usr/local/bin/${TRAY_BINARY}"
 SECRETS_DEST="/usr/local/bin/${SECRETS_BINARY}"
@@ -443,7 +441,6 @@ PIN_SO_DEST="/usr/lib/security/mykeypin.so"
 AUTH_SO_DEST="/usr/lib/security/pam_mykey.so"
 PIN_DIR="/etc/mykey/pin"
 LOCAL_AUTH_DIR="/etc/mykey/auth"
-HOST_MANIFEST_SRC="${REPO_ROOT}/scripts/com.mykey.host.json"
 SYSTEMD_UNIT_SRC="${REPO_ROOT}/scripts/mykey-daemon.service"
 TRAY_SERVICE_SRC="${REPO_ROOT}/scripts/mykey-tray.service"
 SECRETS_SERVICE_SRC="${REPO_ROOT}/scripts/mykey-secrets.service"
@@ -456,9 +453,6 @@ TRUSTED_HASHES="${WEBAUTHN_DIR}/trusted-binaries.json"
 POLKIT_POLICY="/usr/share/polkit-1/actions/com.mykey.authenticate.policy"
 SYSTEMD_UNIT="/etc/systemd/system/mykey-daemon.service"
 DAEMON_USER="mykey"
-CHROME_NMH_DIR="/etc/opt/chrome/native-messaging-hosts"
-CHROMIUM_NMH_DIR="/etc/chromium/native-messaging-hosts"
-
 # ── 4.1 Create dedicated system user ─────────────────────────────────────
 echo ""
 info "Ensuring system user '${DAEMON_USER}' exists..."
@@ -481,26 +475,17 @@ EOF
 sudo chmod 0440 /etc/sudoers.d/mykey
 ok "Sudoers rule installed."
 
-# ── 4.2 Build native host ─────────────────────────────────────────────────
-echo ""
-info "Building ${HOST_BINARY} (release)..."
-cd "${REPO_ROOT}/mykey-host"
-RUSTFLAGS="-A warnings" "${CARGO}" build --release
-ok "Build complete: ${HOST_BINARY}"
-
-# ── 4.3 Build daemon ──────────────────────────────────────────────────────
+# ── 4.2 Build daemon ──────────────────────────────────────────────────────
 echo ""
 info "Building ${DAEMON_BINARY} (release)..."
 cd "${REPO_ROOT}/mykey-daemon"
 RUSTFLAGS="-A warnings" "${CARGO}" build --features tpm2 --release
 ok "Build complete: ${DAEMON_BINARY}"
 
-# ── 4.4 Install binaries ──────────────────────────────────────────────────
+# ── 4.3 Install binaries ──────────────────────────────────────────────────
 echo ""
 info "Installing binaries..."
-sudo install -m 0755 "${REPO_ROOT}/mykey-host/target/release/${HOST_BINARY}" "${HOST_DEST}"
 sudo install -m 0755 "${REPO_ROOT}/mykey-daemon/target/release/${DAEMON_BINARY}" "${DAEMON_DEST}"
-ok "${HOST_DEST}"
 ok "${DAEMON_DEST}"
 
 # ── 4.5 Create /etc/mykey/ directory structure ───────────────────
@@ -509,30 +494,20 @@ info "Creating ${WEBAUTHN_DIR}/ directories..."
 sudo install -d -m 0700 -o "${DAEMON_USER}" "${WEBAUTHN_DIR}"
 sudo install -d -m 0700 -o "${DAEMON_USER}" "${CREDENTIAL_DIR}"
 sudo install -d -m 0700 -o "${DAEMON_USER}" "${KEY_DIR}"
-# Temporarily open /etc/mykey so the real user's secrets/ subdirectory can be created
-sudo chmod 755 "${WEBAUTHN_DIR}"
-sudo install -d -m 0700 -o "${REAL_USER}" "${WEBAUTHN_DIR}/secrets"
-sudo install -d -m 0700 -o "${REAL_USER}" "${WEBAUTHN_DIR}/secrets/default"
-sudo install -d -m 0700 -o "${REAL_USER}" "${WEBAUTHN_DIR}/provider"
 sudo install -d -m 0700 -o "${DAEMON_USER}" "${PIN_DIR}"
 sudo install -d -m 0700 -o "${DAEMON_USER}" "${LOCAL_AUTH_DIR}"
-# Restore /etc/mykey — 711 allows traversal by the real user without exposing listings
-sudo chmod 711 "${WEBAUTHN_DIR}"
 ok "Directories ready."
 
 # ── 4.7 Write initial trusted binary hashes ───────────────────────────────
 echo ""
 info "Writing trusted binary hashes to ${TRUSTED_HASHES}..."
-HOST_HASH="$(sha256sum "${HOST_DEST}" | awk '{print $1}')"
 DAEMON_HASH="$(sha256sum "${DAEMON_DEST}" | awk '{print $1}')"
 sudo tee "${TRUSTED_HASHES}" > /dev/null << EOF
 [
-  { "path": "${HOST_DEST}",   "sha256": "${HOST_HASH}" },
   { "path": "${DAEMON_DEST}", "sha256": "${DAEMON_HASH}" }
 ]
 EOF
 sudo chmod 0644 "${TRUSTED_HASHES}"
-ok "mykey-host:  ${HOST_HASH}"
 ok "mykey-daemon: ${DAEMON_HASH}"
 
 # ── 4.8 Install D-Bus system policy ──────────────────────────────────────
@@ -549,20 +524,7 @@ sudo install -m 0644 "${REPO_ROOT}/scripts/com.mykey.authenticate.policy" \
     "${POLKIT_POLICY}"
 ok "Polkit policy installed."
 
-# ── 4.10 Install native messaging host manifests ──────────────────────────
-install_manifest() {
-    local dest_dir="$1"
-    sudo mkdir -p "${dest_dir}"
-    sudo install -m 0644 "${HOST_MANIFEST_SRC}" "${dest_dir}/com.mykey.host.json"
-    ok "Manifest installed to ${dest_dir}/"
-}
-
-echo ""
-info "Installing native messaging host manifests..."
-install_manifest "${CHROME_NMH_DIR}"
-install_manifest "${CHROMIUM_NMH_DIR}"
-
-# ── 4.11 Install and enable systemd daemon service ────────────────────────
+# ── 4.10 Install and enable systemd daemon service ────────────────────────
 echo ""
 info "Installing systemd service unit..."
 sudo install -m 0644 "${SYSTEMD_UNIT_SRC}" "${SYSTEMD_UNIT}"
@@ -585,9 +547,6 @@ ok "${TRAY_DEST}"
 echo ""
 info "Installing tray user service..."
 
-REAL_USER_ID=$(id -u "${REAL_USER}")
-REAL_XDG_RUNTIME="/run/user/${REAL_USER_ID}"
-REAL_DBUS="unix:path=${REAL_XDG_RUNTIME}/bus"
 SYSTEMD_USER_DIR="${REAL_HOME}/.config/systemd/user"
 
 mkdir -p "${SYSTEMD_USER_DIR}"
@@ -596,15 +555,7 @@ cp "${TRAY_SERVICE_SRC}" "${SYSTEMD_USER_DIR}/mykey-tray.service"
 chmod 0644 "${SYSTEMD_USER_DIR}/mykey-tray.service"
 
 systemctl --user daemon-reload
-systemctl --user enable --now mykey-tray
-
-# Symlink fallback to guarantee enable persists
-AUTOSTART_DIR="${SYSTEMD_USER_DIR}/default.target.wants"
-mkdir -p "${AUTOSTART_DIR}"
-ln -sf "${SYSTEMD_USER_DIR}/mykey-tray.service" \
-       "${AUTOSTART_DIR}/mykey-tray.service"
-
-ok "Tray service installed and enabled for user '${REAL_USER}'"
+ok "Tray service installed for user '${REAL_USER}' (optional; enable with: mykey-tray enable)"
 
 # ── 4.15 Build mykey-secrets ─────────────────────────────────────────────────
 echo ""
@@ -636,6 +587,8 @@ systemctl --user daemon-reload
 systemctl --user enable mykey-secrets
 
 # Symlink fallback to guarantee enable persists
+AUTOSTART_DIR="${SYSTEMD_USER_DIR}/default.target.wants"
+mkdir -p "${AUTOSTART_DIR}"
 ln -sf "${SYSTEMD_USER_DIR}/mykey-secrets.service" \
        "${AUTOSTART_DIR}/mykey-secrets.service"
 
@@ -695,11 +648,9 @@ ok "${AUTH_SO_DEST}"
 # Update binary hashes after installation
 echo ""
 info "Updating trusted binary hashes..."
-HOST_HASH="$(sha256sum "${HOST_DEST}" | awk '{print $1}')"
 DAEMON_HASH="$(sha256sum "${DAEMON_DEST}" | awk '{print $1}')"
 sudo tee "${TRUSTED_HASHES}" > /dev/null << EOF
 [
-  { "path": "${HOST_DEST}",   "sha256": "${HOST_HASH}" },
   { "path": "${DAEMON_DEST}", "sha256": "${DAEMON_HASH}" }
 ]
 EOF
@@ -723,21 +674,9 @@ else
     die "mykey-daemon failed to start. Check: journalctl -u mykey-daemon -n 20"
 fi
 
-info "Starting mykey-tray..."
-systemctl --user start mykey-tray 2>/dev/null || true
-sleep 1
-if systemctl --user is-active --quiet mykey-tray 2>/dev/null; then
-    ok "mykey-tray is running"
-else
-    warn "mykey-tray did not start — you can start it manually:"
-    warn "systemctl --user start mykey-tray"
-fi
-
 # Clean up stale log files that may be owned by mykey system user
 sudo rm -f /tmp/mykey-secrets.log
 sudo rm -f /tmp/mykey-daemon.log
-sudo rm -f /tmp/mykey-host.log
-sudo rm -f /tmp/mykey-tray.log
 
 # ── Secret Service enrollment ─────────────────────────────────────
 echo ""
@@ -745,182 +684,24 @@ info "Running mykey-migrate --enroll..."
 mykey-migrate --enroll || die "Enrollment failed. Fix the error above and run ./scripts/install.sh again."
 
 # ════════════════════════════════════════════════════════════════════════════
-# PHASE 6 — EXTENSION SETUP
+# PHASE 6 — FINAL HEALTH CHECK
 # ════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "════════════════════════════════════════════════════════════"
-echo " Phase 6 — Browser Extension Setup"
-echo "════════════════════════════════════════════════════════════"
-
-declare -A BROWSERS
-BROWSER_NAMES=()
-
-check_browser() {
-    local name="$1"
-    local binary="$2"
-    if command -v "${binary}" &>/dev/null; then
-        # Only add name once (first binary wins for each name)
-        if [[ -z "${BROWSERS[${name}]:-}" ]]; then
-            BROWSERS["${name}"]="${binary}"
-            BROWSER_NAMES+=("${name}")
-        fi
-    fi
-}
-
-check_browser "Google Chrome"       google-chrome-stable
-check_browser "Google Chrome"       google-chrome
-check_browser "Chromium"            chromium
-check_browser "Chromium"            chromium-browser
-check_browser "Ungoogled Chromium"  ungoogled-chromium
-check_browser "Brave"               brave-browser
-check_browser "Microsoft Edge"      microsoft-edge-stable
-check_browser "Microsoft Edge"      microsoft-edge
-check_browser "Vivaldi"             vivaldi-stable
-check_browser "Vivaldi"             vivaldi
-
-SELECTED_BROWSER=""
-SELECTED_BINARY=""
-
-if [[ ${#BROWSER_NAMES[@]} -eq 0 ]]; then
-    echo ""
-    warn "No supported Chromium-based browser detected"
-    warn "Install one of: Google Chrome, Chromium, Brave, Edge, Vivaldi"
-    warn "The webAuthenticationProxy API is Chromium-only — Firefox is not supported"
-    warn "You will need to open your browser manually for the steps below"
-    FAILED=1
-else
-    echo ""
-    info "Found ${#BROWSER_NAMES[@]} supported browser(s):"
-    for name in "${BROWSER_NAMES[@]}"; do
-        echo "      - ${name} (${BROWSERS[${name}]})"
-    done
-
-    if [[ ${#BROWSER_NAMES[@]} -eq 1 ]]; then
-        SELECTED_BROWSER="${BROWSER_NAMES[0]}"
-        SELECTED_BINARY="${BROWSERS[${SELECTED_BROWSER}]}"
-        info "Using: ${SELECTED_BROWSER}"
-    else
-        echo ""
-        echo "  Multiple browsers detected. Which would you like to use?"
-        select choice in "${BROWSER_NAMES[@]}"; do
-            if [[ -n "${choice}" ]]; then
-                SELECTED_BROWSER="${choice}"
-                SELECTED_BINARY="${BROWSERS[${choice}]}"
-                break
-            fi
-        done
-    fi
-fi
-
-echo ""
-echo "  ────────────────────────────────────────────────────────"
-echo "  Load the MyKey Proxy extension in your browser."
-echo "  Follow each step carefully."
-echo "  ────────────────────────────────────────────────────────"
-echo ""
-read -rp "  Press Enter when you are ready to continue..."
-
-# Step 1 — Open browser to extensions page
-echo ""
-info "Step 1: Open your browser to chrome://extensions"
-info "Enable Developer Mode, then click 'Load unpacked' and select: ${REPO_ROOT}/mykey-proxy/chromium"
-echo ""
-if [[ -n "${SELECTED_BINARY:-}" ]]; then
-    info "Opening ${SELECTED_BROWSER} now..."
-    "${SELECTED_BINARY}" "chrome://extensions" &
-fi
-echo ""
-read -rp "  Press Enter once the browser is open and you can see chrome://extensions/..."
-
-# Step 2 — Developer mode
-echo ""
-echo "  Step 2: Enable Developer Mode"
-echo "  Look for the 'Developer mode' toggle in the top right corner"
-echo "  of the extensions page and turn it ON."
-echo ""
-read -rp "  Press Enter once Developer Mode is enabled..."
-
-# Step 3 — Load unpacked
-echo ""
-echo "  Step 3: Load the extension"
-echo "  Click the 'Load unpacked' button that appeared after enabling"
-echo "  Developer Mode."
-echo ""
-echo "  When the folder picker opens, navigate to:"
-echo "      ${REPO_ROOT}/mykey-proxy/chromium"
-echo ""
-read -rp "  Press Enter once you have selected the extension folder..."
-
-# Step 4 — Get extension ID
-echo ""
-echo "  Step 4: Copy your Extension ID"
-echo "  The MyKey Proxy extension should now appear on the page."
-echo "  Under the extension name you will see an ID that looks like:"
-echo "      abcdefghijklmnopabcdefghijklmnop"
-echo "  (32 characters, lowercase letters a through p only)"
-echo ""
-
-EXTENSION_ID=""
-while true; do
-    read -rp "  Paste your Extension ID here: " EXTENSION_ID
-    if [[ "${EXTENSION_ID}" =~ ^[a-p]{32}$ ]]; then
-        ok "Valid Extension ID: ${EXTENSION_ID}"
-        break
-    else
-        echo ""
-        fail "Invalid format — must be exactly 32 characters using only letters a-p"
-        echo "  Please check the ID and try again."
-        echo ""
-    fi
-done
-
-# Apply extension ID to all manifest files
-UPDATED=0
-for f in \
-    "${CHROME_NMH_DIR}/com.mykey.host.json" \
-    "${CHROMIUM_NMH_DIR}/com.mykey.host.json" \
-    "${REAL_HOME}/.config/google-chrome/NativeMessagingHosts/com.mykey.host.json" \
-    "${REAL_HOME}/.config/chromium/NativeMessagingHosts/com.mykey.host.json"
-do
-    if [[ -f "${f}" ]]; then
-        sudo sed -i "s|EXTENSION_ID_PLACEHOLDER|${EXTENSION_ID}|g" "${f}"
-        ok "Updated: ${f}"
-        UPDATED=1
-    fi
-done
-
-if [[ "${UPDATED}" -eq 0 ]]; then
-    fail "No manifest files found to update"
-    FAILED=1
-fi
-
-# Step 5 — Reload extension
-echo ""
-echo "  Step 5: Reload the extension"
-echo "  Go back to chrome://extensions/ and click the"
-echo "  refresh/reload icon on the MyKey Proxy extension card."
-echo ""
-read -rp "  Press Enter once you have reloaded the extension..."
-
-# ════════════════════════════════════════════════════════════════════════════
-# PHASE 7 — FINAL HEALTH CHECK
-# ════════════════════════════════════════════════════════════════════════════
-echo ""
-echo "════════════════════════════════════════════════════════════"
-echo " Phase 7 — Final Health Check"
+echo " Phase 6 — Final Health Check"
 echo "════════════════════════════════════════════════════════════"
 echo ""
 
-# [1/9] Secure Boot
-echo "[1/9] Secure Boot..."
+# [1/8] Secure Boot
+echo "[1/8] Secure Boot..."
 SB_FINAL="$(detect_secure_boot_state)"
 case "${SB_FINAL}" in
     enabled) ok "Secure Boot is enabled" ;;
     *)       fail "Secure Boot is not enabled"; FAILED=1 ;;
 esac
 
-# [2/9] TPM2
-echo "[2/9] TPM2..."
+# [2/8] TPM2
+echo "[2/8] TPM2..."
 if [[ -c /dev/tpm0 && -c /dev/tpmrm0 ]]; then
     ok "TPM2 present"
 else
@@ -928,9 +709,9 @@ else
     FAILED=1
 fi
 
-# [3/9] Binaries
-echo "[3/9] Binaries..."
-for bin in "${HOST_BINARY}" "${DAEMON_BINARY}" "${TRAY_BINARY}" "${SECRETS_BINARY}" "mykey-migrate" "${PIN_BINARY}" "${PIN_HELPER_BINARY}" "${AUTH_BINARY}"; do
+# [3/8] Binaries
+echo "[3/8] Binaries..."
+for bin in "${DAEMON_BINARY}" "${TRAY_BINARY}" "${SECRETS_BINARY}" "mykey-migrate" "${PIN_BINARY}" "${PIN_HELPER_BINARY}" "${AUTH_BINARY}"; do
     if [[ -x "/usr/local/bin/${bin}" ]]; then
         ok "/usr/local/bin/${bin}"
     else
@@ -939,8 +720,8 @@ for bin in "${HOST_BINARY}" "${DAEMON_BINARY}" "${TRAY_BINARY}" "${SECRETS_BINAR
     fi
 done
 
-# [4/9] Configuration files
-echo "[4/9] Configuration..."
+# [4/8] Configuration files
+echo "[4/8] Configuration..."
 for f in \
     "${TRUSTED_HASHES}" \
     "${POLKIT_POLICY}" \
@@ -956,25 +737,8 @@ do
     fi
 done
 
-# [5/9] Extension ID
-echo "[5/9] Extension ID..."
-ID_SET=0
-for f in \
-    "${CHROME_NMH_DIR}/com.mykey.host.json" \
-    "${CHROMIUM_NMH_DIR}/com.mykey.host.json"
-do
-    if [[ -f "${f}" ]] && ! grep -q "EXTENSION_ID_PLACEHOLDER" "${f}"; then
-        ok "Extension ID configured in ${f}"
-        ID_SET=1
-    fi
-done
-if [[ "${ID_SET}" -eq 0 ]]; then
-    fail "Extension ID not set in any manifest"
-    FAILED=1
-fi
-
-# [6/9] Binary integrity
-echo "[6/9] Binary integrity..."
+# [5/8] Binary integrity
+echo "[5/8] Binary integrity..."
 if command -v python3 &>/dev/null; then
     sudo python3 - << 'PYEOF'
 import json, hashlib, sys
@@ -1000,8 +764,8 @@ else
     warn "python3 not found — skipping hash verification"
 fi
 
-# [7/9] Daemon service
-echo "[7/9] Daemon service..."
+# [6/8] Daemon service
+echo "[6/8] Daemon service..."
 if systemctl is-active --quiet mykey-daemon; then
     ok "mykey-daemon is running"
 else
@@ -1009,17 +773,20 @@ else
     FAILED=1
 fi
 
-# [8/9] Tray service
-echo "[8/9] Tray service..."
+# [7/8] Tray service
+echo "[7/8] Tray service..."
 if systemctl --user is-active --quiet mykey-tray 2>/dev/null; then
     ok "mykey-tray is running"
+elif systemctl --user is-enabled --quiet mykey-tray 2>/dev/null; then
+    warn "mykey-tray is enabled but not running"
+    warn "Check with: mykey-tray status"
 else
-    warn "mykey-tray is not running"
-    warn "Start with: systemctl --user start mykey-tray"
+    ok "mykey-tray is optional and currently off"
+    echo "    Enable later with: mykey-tray enable"
 fi
 
-# [9/9] Secrets service
-echo "[9/9] Secrets service..."
+# [8/8] Secrets service
+echo "[8/8] Secrets service..."
 if systemctl --user is-active --quiet mykey-secrets 2>/dev/null; then
     ok "mykey-secrets is running"
 else
@@ -1033,15 +800,14 @@ echo "════════════════════════�
 if [[ "${FAILED}" -eq 0 ]]; then
     echo " Installation complete — all checks passed."
     echo ""
-    echo " Test the proxy:"
-    echo "   1. Open https://webauthn.io in ${SELECTED_BROWSER:-your browser}"
-    echo "   2. Enter a username and click Register"
-    echo "   3. You will be prompted for your Linux password or PIN"
-    echo "   4. Complete registration then test Sign In"
+    echo " Next validation steps:"
+    echo "   1. Verify PIN status with: mykey-pin status"
+    echo "   2. Verify Secret Service with: systemctl --user status mykey-secrets"
+    echo "   3. Optional tray: mykey-tray enable"
+    echo "   4. Verify tray status with: mykey-tray status"
     echo ""
     echo " Live logs:"
     echo "   journalctl -u mykey-daemon -f"
-    echo "   tail -f /tmp/mykey-host.log"
 else
     echo " Installation completed with errors — review the output above."
     echo " Fix any failed checks and run ./scripts/install.sh again."

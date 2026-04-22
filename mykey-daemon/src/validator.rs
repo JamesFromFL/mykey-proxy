@@ -44,7 +44,9 @@ pub fn verify_caller_process(pid: u32) -> bool {
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             // Daemon runs as a different user — exe unreadable, fall through to cmdline
-            debug!("[validator] pid={pid} exe unreadable (permission denied) — deferring to cmdline");
+            debug!(
+                "[validator] pid={pid} exe unreadable (permission denied) — deferring to cmdline"
+            );
             true
         }
         Err(e) => {
@@ -151,7 +153,6 @@ fn is_valid_browser_exe(path: &str) -> bool {
 /// characteristics (systemd or shell parents) and must not be conflated with
 /// browser processes.
 const TRUSTED_MYKEY_BINARIES: &[&str] = &[
-    "mykey-host",
     "mykey-secrets",
     "mykey-migrate",
     "mykey-manager",
@@ -165,7 +166,9 @@ fn is_valid_mykey_program(program: &str) -> bool {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(program);
-    TRUSTED_MYKEY_BINARIES.iter().any(|trusted| *trusted == name)
+    TRUSTED_MYKEY_BINARIES
+        .iter()
+        .any(|trusted| *trusted == name)
 }
 
 fn canonical_mykey_program_name(program: &str) -> Option<&'static str> {
@@ -173,7 +176,10 @@ fn canonical_mykey_program_name(program: &str) -> Option<&'static str> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(program);
-    TRUSTED_MYKEY_BINARIES.iter().copied().find(|trusted| *trusted == name)
+    TRUSTED_MYKEY_BINARIES
+        .iter()
+        .copied()
+        .find(|trusted| *trusted == name)
 }
 
 fn cmdline_program(cmdline: &[u8]) -> Option<&str> {
@@ -197,7 +203,9 @@ pub fn trusted_mykey_program(pid: u32) -> Option<&'static str> {
                 debug!("[validator] pid={pid} exe={s} — recognised MyKey binary");
                 return Some(name);
             }
-            debug!("[validator] pid={pid} exe={s} — not a recognised MyKey binary, checking cmdline");
+            debug!(
+                "[validator] pid={pid} exe={s} — not a recognised MyKey binary, checking cmdline"
+            );
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             debug!("[validator] pid={pid} exe unreadable (permission denied) — checking cmdline");
@@ -215,7 +223,9 @@ pub fn trusted_mykey_program(pid: u32) -> Option<&'static str> {
                 Some(program) if is_valid_mykey_program(program) => {
                     let name = canonical_mykey_program_name(program)
                         .expect("trusted MyKey cmdline program should canonicalize");
-                    debug!("[validator] pid={pid} cmdline argv0={program} — recognised MyKey binary");
+                    debug!(
+                        "[validator] pid={pid} cmdline argv0={program} — recognised MyKey binary"
+                    );
                     Some(name)
                 }
                 _ => {

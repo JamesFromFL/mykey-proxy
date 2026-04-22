@@ -1,4 +1,4 @@
-// main.rs — MyKey Proxy D-Bus daemon entry point.
+// main.rs — MyKey D-Bus daemon entry point.
 //
 // Startup order:
 //   1. Initialise file logger (never stdout/stderr in production)
@@ -7,8 +7,8 @@
 //   4. Register D-Bus service "com.mykey.Daemon" on the system bus
 //   5. Run the tokio event loop indefinitely
 
-use std::sync::Arc;
 use log::{error, info};
+use std::sync::Arc;
 
 mod authentication;
 mod credentials;
@@ -92,9 +92,7 @@ async fn main() {
         }
     };
 
-    info!(
-        "D-Bus service registered: name='com.mykey.Daemon' path='/com/mykey/Daemon'"
-    );
+    info!("D-Bus service registered: name='com.mykey.Daemon' path='/com/mykey/Daemon'");
 
     // Keep the connection alive.  The daemon exits only on signal or fatal error.
     // `conn` must stay in scope — dropping it closes the D-Bus connection.

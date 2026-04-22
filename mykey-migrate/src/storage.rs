@@ -1,15 +1,17 @@
 // storage.rs — On-disk storage for Secret Service collections and items.
 //
-// Secrets are stored as TPM2-sealed blobs under /etc/mykey/secrets/.
+// Secrets are stored as TPM2-sealed blobs under the user's MyKey data dir.
 // Layout:
-//   /etc/mykey/secrets/<collection_id>/collection.json
-//   /etc/mykey/secrets/<collection_id>/<item_id>.json
+//   $XDG_DATA_HOME/mykey/secrets/<collection_id>/collection.json
+//   $XDG_DATA_HOME/mykey/secrets/<collection_id>/<item_id>.json
+// Fallback:
+//   ~/.local/share/mykey/secrets/<collection_id>/...
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
-const BASE_DIR: &str = "/etc/mykey/secrets";
+use crate::paths;
 
 fn internal_stage_dir_name() -> String {
     format!(".staging-{}", uuid::Uuid::new_v4())
@@ -38,24 +40,20 @@ fn remove_path(path: &Path) -> Result<(), String> {
 
 fn save_collection_in(base_dir: &Path, c: &StoredCollection) -> Result<(), String> {
     let dir = base_dir.join(&c.id);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Cannot create collection dir {}: {e}", dir.display()))?;
+    paths::ensure_private_dir(&dir)?;
     let path = dir.join("collection.json");
     let data = serde_json::to_vec_pretty(c)
         .map_err(|e| format!("Cannot serialise collection: {e}"))?;
-    std::fs::write(&path, data)
-        .map_err(|e| format!("Cannot write {}: {e}", path.display()))
+    paths::write_private_file(&path, &data)
 }
 
 fn save_item_in(base_dir: &Path, item: &StoredItem) -> Result<(), String> {
     let dir = base_dir.join(&item.collection_id);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Cannot create item dir {}: {e}", dir.display()))?;
+    paths::ensure_private_dir(&dir)?;
     let path = dir.join(format!("{}.json", item.id));
     let data = serde_json::to_vec_pretty(item)
         .map_err(|e| format!("Cannot serialise item: {e}"))?;
-    std::fs::write(&path, data)
-        .map_err(|e| format!("Cannot write {}: {e}", path.display()))
+    paths::write_private_file(&path, &data)
 }
 
 /// Metadata for a stored collection (persisted as collection.json).
@@ -91,16 +89,10 @@ pub struct ActivatedStorage {
 
 impl StagedStorage {
     pub fn new() -> Result<Self, String> {
-        let base = Path::new(BASE_DIR);
-        if !base.exists() {
-            return Err(format!(
-                "Base storage dir {} does not exist. Check that /etc/mykey/secrets/ is accessible.",
-                base.display()
-            ));
-        }
+        let base = base_dir();
+        paths::ensure_private_dir(&base)?;
         let path = base.join(internal_stage_dir_name());
-        std::fs::create_dir_all(&path)
-            .map_err(|e| format!("Cannot create staging dir {}: {e}", path.display()))?;
+        paths::ensure_private_dir(&path)?;
         Ok(Self { path })
     }
 
@@ -121,13 +113,12 @@ impl StagedStorage {
     }
 
     pub fn activate(self) -> Result<ActivatedStorage, String> {
-        let base = Path::new(BASE_DIR);
+        let base = base_dir();
         let backup = base.join(internal_backup_dir_name());
-        std::fs::create_dir_all(&backup)
-            .map_err(|e| format!("Cannot create backup dir {}: {e}", backup.display()))?;
+        paths::ensure_private_dir(&backup)?;
 
         let mut moved_existing: Vec<PathBuf> = Vec::new();
-        let existing_entries = std::fs::read_dir(base)
+        let existing_entries = std::fs::read_dir(&base)
             .map_err(|e| format!("Cannot list storage dir {}: {e}", base.display()))?;
 
         for entry in existing_entries {
@@ -158,7 +149,7 @@ impl StagedStorage {
             let staged_path = entry.path();
             let active_path = base.join(entry.file_name());
             if let Err(e) = std::fs::rename(&staged_path, &active_path) {
-                for path in std::fs::read_dir(base)
+                for path in std::fs::read_dir(&base)
                     .ok()
                     .into_iter()
                     .flat_map(|iter| iter.flatten())
@@ -214,9 +205,9 @@ impl ActivatedStorage {
     }
 
     pub fn rollback(self) -> Result<(), String> {
-        let base = Path::new(BASE_DIR);
+        let base = base_dir();
         if base.exists() {
-            for entry in std::fs::read_dir(base)
+            for entry in std::fs::read_dir(&base)
                 .map_err(|e| format!("Cannot list active storage {}: {e}", base.display()))?
             {
                 let entry = entry.map_err(|e| {
@@ -265,12 +256,12 @@ impl ActivatedStorage {
 
 /// Load all collections from disk.  Missing or unreadable entries are skipped.
 pub fn load_collections() -> Vec<StoredCollection> {
-    let base = Path::new(BASE_DIR);
+    let base = base_dir();
     if !base.exists() {
         return Vec::new();
     }
     let mut cols = Vec::new();
-    let entries = match std::fs::read_dir(base) {
+    let entries = match std::fs::read_dir(&base) {
         Ok(e) => e,
         Err(_) => return cols,
     };
@@ -290,7 +281,7 @@ pub fn load_collections() -> Vec<StoredCollection> {
 
 /// Load all items belonging to a collection.
 pub fn load_items(collection_id: &str) -> Vec<StoredItem> {
-    let dir = Path::new(BASE_DIR).join(collection_id);
+    let dir = base_dir().join(collection_id);
     if !dir.exists() {
         return Vec::new();
     }
@@ -313,4 +304,17 @@ pub fn load_items(collection_id: &str) -> Vec<StoredItem> {
         }
     }
     items
+}
+
+pub fn base_dir() -> PathBuf {
+    paths::secrets_dir()
+}
+
+pub fn remove_all_storage() -> Result<(), String> {
+    let base = base_dir();
+    if base.exists() {
+        std::fs::remove_dir_all(&base)
+            .map_err(|e| format!("Cannot remove {}: {e}", base.display()))?;
+    }
+    Ok(())
 }

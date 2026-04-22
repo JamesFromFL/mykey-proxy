@@ -1,6 +1,6 @@
 # MyKey TO-DO
 
-Last updated: 2026-04-20
+Last updated: 2026-04-21
 
 ## Purpose
 - Canonical running to-do list for MyKey release hardening.
@@ -15,7 +15,7 @@ Last updated: 2026-04-20
   - KeePassXC readiness handling is improved and now stops with explicit setup guidance.
   - enroll path has already been hardened.
   - enroll now unlocks source collections before bulk secret reads, so locked source keyrings fail with a prompt instead of partial-read errors.
-  - enroll staging now activates inside the writable `/etc/mykey/secrets` tree instead of requiring writes to `/etc/mykey`.
+  - enroll staging now activates inside the writable per-user MyKey secrets store instead of requiring writes to `/etc/mykey`.
 - `mykey-pin`
   - active redesign target
   - not yet release-ready
@@ -42,10 +42,10 @@ Last updated: 2026-04-20
 
 1. [x] `Critical` `mykey-daemon` Tighten daemon trust boundary for PIN work.
    - exact trusted MyKey binary basename matching
-   - include `mykey-host`, `mykey-pin`, and `mykey-pin-auth` in trusted MyKey caller set
+   - include trusted MyKey caller binaries such as `mykey-pin`, `mykey-pin-auth`, `mykey-auth`, `mykey-secrets`, `mykey-migrate`, and `mykey-manager`
    - cross-check caller-supplied PID against D-Bus sender credentials
    - enforce sender/PID verification on `Connect`, `Register`, `Authenticate`, `SealSecret`, `UnsealSecret`, and `Disconnect`
-   - verified with `mykey-daemon` release build and `mykey-host` release build
+   - verified with `mykey-daemon` release build
 
 2. [x] `Critical` `mykey-daemon` Add daemon-owned per-user PIN storage helpers.
    - daemon-side `PinStore`
@@ -98,7 +98,7 @@ Last updated: 2026-04-20
    - verified with `mykey-migrate` release build
 
 10. [x] `Important` `mykey-migrate` Keep enroll staging inside the writable secrets tree.
-   - stage and rollback within `/etc/mykey/secrets`
+   - stage and rollback within the writable user secrets tree
    - avoid permission failures from renaming through `/etc/mykey`
    - verified with `mykey-migrate` release build
 
@@ -182,21 +182,37 @@ Last updated: 2026-04-20
    - modules callable directly from terminal
    - installer replaces current script-only assumptions
 
-22. [ ] `Critical` `audit` Audit `mykey-host` against the current daemon-owned architecture.
+22. [x] `Critical` `audit` Audit and retire `mykey-host` from the current architecture.
    - identify stale host-side auth, PAM, TPM, or crypto responsibilities that should already live in `mykey-daemon`
    - confirm the host only handles native messaging, daemon session transport, and request/response marshaling
-   - remove or plan removal of legacy modules that no longer match the current trust boundary
+   - stale host-side PAM, TPM, legacy crypto helpers, and local credential-resolution code have been removed from the compiled host path
+   - the host component was then removed entirely once the extension and native-messaging path left project scope
 
-23. [ ] `Important` `audit` Audit `mykey-secrets` and `mykey-tray` against the current auth and trust model.
+23. [x] `Important` `audit` Audit `mykey-secrets` and `mykey-tray` against the current auth and trust model.
    - verify daemon integration assumptions
    - identify stale direct-auth assumptions
    - identify release-critical correctness or trust-boundary issues
+   - `mykey-secrets` no longer serves stale in-memory collection, item, or alias state after runtime create/replace/delete operations
+   - `mykey-secrets` now updates replace-in-place items on disk coherently and `GetSecret` reads the current stored item state
+   - `mykey-secrets` collection, item, and alias JSON writes now use atomic replace semantics
+   - `mykey-secrets` default `/tmp` logging has been removed; logging is now opt-in through `MYKEY_SECRETS_LOG`
+   - `mykey-secrets` no longer logs search attribute values by default, and storage load failures are now surfaced in warnings instead of being silently skipped
+   - `mykey-tray` default `/tmp` logging has been removed; logging is now opt-in through `MYKEY_TRAY_LOG`
+   - `mykey-tray` now exposes `enable`, `disable`, and `status` CLI commands and shares one component-status snapshot path with the tray menu
+   - `mykey-tray` is now optional in install flow and no longer forces a hardcoded `DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, or `default.target.wants` autostart path
+   - `mykey-tray` now exits when `mykey-daemon` is no longer active instead of lingering as a detached status icon
 
 24. [ ] `Low` `mykey-manager` Defer manager audit and implementation until the backend and TUI stack are stable.
    - current `mykey-manager` is only a placeholder shell
    - real manager work should happen after the functional local-auth and secrets stack is settled
 
-25. [ ] `Important` `audit` Audit installer, service, D-Bus, and polkit wiring as one release surface.
+25. [x] `Important` `audit` Audit installer, service, D-Bus, and polkit wiring as one release surface.
+   - the current script-driven install/remove path is not package-safe because it writes package payload into `/usr/local`, `~/.config/systemd/user`, and `/etc/systemd/system`
+   - the current install/remove path is coupled to live runtime state through service startup and `mykey-migrate --enroll` / `--unenroll`
+   - the current sudoers rule for `pkcheck` appears stale because the daemon executes `pkcheck` directly
+   - the current polkit defaults are broader than a local-active-session-only trust model
+   - the current `mykey-daemon` service hardening is still coupled to legacy `/tmp` logging
+   - the current Secret Service session-bus policy file should be retained only if its necessity is proven
    - `scripts/install.sh`
    - `scripts/uninstall.sh`
    - systemd units
@@ -226,6 +242,45 @@ Last updated: 2026-04-20
    - recovery factor only, not a normal authentication method
    - should help with forgotten PIN or lockout recovery
    - keep it local and optional, with clear backup and recovery expectations
+
+31. [x] `Important` `scope` Remove `mykey-proxy` from project scope and repo.
+   - the extension-based WebAuthn proxy is no longer a product direction
+   - MyKey is pivoting toward native cross-platform authenticator behavior instead of store-submitted browser interception
+
+32. [ ] `Important` `research` Explore legitimate Linux platform-authenticator integration as research only.
+   - map what a downstream Chromium `kMyKeyLinux`-style backend would require
+   - keep this out of release scope while MyKey pivots to device-bound cross-platform passkeys
+   - document why browser patching is research, not the shipping integration path
+
+33. [ ] `Important` `passkeys` Define the first device-bound cross-platform passkey scope.
+   - keep passkey storage local to MyKey
+   - do not turn MyKey into a syncing password manager or credential migrator
+   - design the authenticator boundary so browser policy stays in the browser and credential protection stays in MyKey
+
+34. [ ] `Moderate` `mykey-tray` Finalize tray status semantics after the current optional-service pass lands.
+   - keep the tray icon menu/status line minimal, with one-word status labels only
+   - keep detailed component state in `mykey-tray status` instead of the tray menu
+   - change `mykey-auth` tray status from binary-presence reporting to daemon-owned local-auth policy reporting
+   - report `mykey-auth` as `configured` or `unconfigured` based on real local-auth policy state
+   - only claim that MyKey is `managing` local auth once PAM integration can be verified reliably instead of inferred
+
+35. [ ] `Important` `packaging` Pivot delivery from script-driven install to Arch/AUR packaging.
+   - use [packaging/arch/TRANSITION.md](/home/james/Git/mykey/packaging/arch/TRANSITION.md) as the package/setup split
+   - initial scaffolding is now in repo:
+     - `packaging/arch/PKGBUILD`
+     - `packaging/arch/mykey.install`
+     - `packaging/arch/mykey.sysusers`
+     - `packaging/arch/mykey.tmpfiles`
+   - move package-owned artifacts out of `/usr/local` and user-home installation logic
+   - demote `scripts/install.sh` and `scripts/uninstall.sh` into developer/setup tooling instead of distribution tooling
+   - keep daemon-owned machine state under `/etc/mykey`, but keep Secret Service user state under the user's MyKey data dir instead of package-owned `/etc` paths
+
+36. [ ] `Important` `mykey-migrate` Harden enroll and teardown around the package-driven setup flow.
+   - package guidance should route first-time Secret Service setup through `mykey-migrate --enroll`, not manual `mykey-secrets` enablement
+   - enroll should verify that the previous provider is still enabled and readable before takeover begins
+   - enroll should be safe against accidental second runs when MyKey already owns `org.freedesktop.secrets`
+   - define teardown as an explicit MyKey action, not ordinary package removal
+   - ordinary package uninstall should preserve `/etc/mykey` state; sensitive cleanup should require successful unenroll or an explicit purge path
 
 ---
 
@@ -292,7 +347,11 @@ Last updated: 2026-04-20
 - [x] Live-validate the Phase A pin-backed `pam_mykey.so` path with `pamtester`.
 - [ ] Build `pam_mykey.so` into the final unified MyKey PAM entrypoint for normal local auth.
 - [ ] Make MyKey, not the user, responsible for auth ordering and fallback between biometrics, security keys, PIN, and password.
-- [ ] Make MyKey responsible for installing and maintaining supported PAM service integration so auth reaches MyKey first.
+- [x] Make MyKey responsible for installing and maintaining supported first-wave PAM service integration so auth reaches MyKey first.
+  - `mykey-auth enable|disable|login|logout|status` now manages MyKey-owned PAM blocks in supported targets instead of asking users to hand-edit `/etc/pam.d`
+  - base managed targets are `sudo` and `polkit-1`
+  - login and unlock takeover is a separate opt-in flow through `mykey-auth login` and `mykey-auth logout`
+  - the managed block uses `-auth` plus PAM control rules so a removed `pam_mykey.so` falls through cleanly on uninstall
 
 ### `local auth policy`
 
@@ -304,22 +363,40 @@ Last updated: 2026-04-20
 - [x] Clear biometric policy automatically when PIN is reset.
 
 #### Important
-- [ ] Define supported first-wave PAM targets such as `sudo`, lock screen, and other safe local auth prompts.
+- [x] Define supported first-wave PAM targets such as `sudo`, lock screen, and other safe local auth prompts.
+  - base managed wave is now `sudo` and `polkit-1`
+  - login and unlock targets are detected separately and only enabled through the dedicated `mykey-auth login` flow
+  - `system-auth`, `system-login`, and `system-local-login` are intentionally left unmanaged because they are too broad for MyKey's takeover scope
 - [ ] Keep elevated MyKey management actions outside biometric-only PAM auth.
 - [ ] Enforce hard local-auth invariants in daemon-owned policy.
   - biometrics require PIN fallback
   - removing or resetting PIN disables biometrics
   - no normal password fallback once PIN exists
+- [ ] Add login-target discovery notifications to `mykey-tray`.
+  - detect newly installed supported login or unlock PAM targets such as `sddm`, `lightdm`, `kde`, or `cinnamon-screensaver`
+  - show a short tray notification directing the user to run `sudo mykey-auth login`
+  - allow per-target dismissal so the same login manager is not prompted repeatedly
 - [ ] Use exponential rate limiting for password fallback and elevated password auth instead of hard lockout.
 
 ### `mykey-biometrics`
 
 #### Important
-- [ ] Add `mykey-biometrics` setup, status, test, and reset flows.
-- [ ] Support backend selection for `fprintd` and `Howdy`.
+- [x] Add the first `mykey-auth biometrics` setup/status/unenroll scaffold.
+  - interactive `enroll`, `unenroll`, `status`, and `exit` flow now lives under `mykey-auth biometrics`
+  - the flow keeps TPM-sealed biometric tracking metadata under `/etc/mykey/auth/<uid>/`
+  - tracked names are MyKey-local biometric people only and do not create Linux accounts
+- [x] Support first biometric backend selection for `fprintd` and `Howdy`.
+  - the current scaffold can enroll through `fprintd` and `Howdy`, detect hardware best-effort, and prompt for package install when practical
+  - MyKey currently tracks only one active biometric backend in daemon policy at a time even if multiple providers are enrolled
 - [ ] Use the existing system biometric stacks instead of reimplementing biometric verification inside MyKey.
-- [ ] Validate backend enrollment before enabling MyKey biometric policy.
+- [x] Validate backend enrollment before enabling MyKey biometric policy.
+  - the scaffold confirms user presence, requires a MyKey PIN fallback, and only flips biometric policy after provider enrollment succeeds
 - [ ] Enable MyKey-managed biometric auth without requiring users to hand-edit PAM files.
+- [ ] Track backend-native scan identifiers when the upstream stack exposes them cleanly.
+  - `fprintd` CLI does not currently expose stable per-scan IDs for MyKey to track
+- [ ] Support finer-grained provider deletion where the upstream biometric stack allows it.
+  - current `fprintd` unenroll path is account-wide, not per recorded fingerprint slot or scan
+- [ ] Support more than one active biometric backend in daemon-owned local-auth policy.
 
 ### `mykey-security-key`
 
@@ -328,6 +405,13 @@ Last updated: 2026-04-20
 - [ ] Use the existing system security-key/FIDO2 stack instead of reimplementing key verification inside MyKey.
 - [ ] Validate security-key enrollment before enabling MyKey security-key policy.
 - [ ] Enable MyKey-managed security-key auth without requiring users to hand-edit PAM files.
+
+### `passkeys`
+
+#### Important
+- [ ] Define MyKey's local passkey storage model for device-bound cross-platform credentials.
+- [ ] Keep browser-facing WebAuthn policy enforcement outside MyKey.
+- [x] Remove `mykey-host`; the current cross-platform direction does not need a native-messaging bridge.
 
 ### `scripts/install.sh` and `scripts/uninstall.sh`
 
@@ -343,15 +427,14 @@ Last updated: 2026-04-20
 ### `audit`
 
 #### Critical
-- [ ] Audit `mykey-host` against the current daemon-owned architecture.
-  - remove or quarantine stale host-side auth logic that no longer matches the trust boundary
-  - current audit findings:
-    - `mykey-host` still compiles legacy PAM, TPM, local crypto, and local credential helper modules that no longer belong in the browser-facing host
-    - `mykey-host` currently logs RP IDs and usernames to `/tmp/mykey-host.log`, which should be treated as a privacy leak and cleaned up during the host refactor
+- [x] Audit and retire `mykey-host` from the current daemon-owned architecture.
+  - stale host-side PAM, TPM, local crypto, and local credential helper modules were removed from the compiled host path
+  - the native-messaging bridge was removed entirely after the project pivoted away from the browser extension architecture
 
 #### Important
-- [ ] Audit `mykey-secrets` and `mykey-tray` against the current auth and trust model.
-- [ ] Audit installer, services, D-Bus policy, and polkit policy as one release surface.
+- [x] Audit `mykey-secrets` and `mykey-tray` against the current auth and trust model.
+- [x] Audit installer, services, D-Bus policy, and polkit policy as one release surface.
+  - package/setup split is now captured in [packaging/arch/TRANSITION.md](/home/james/Git/mykey/packaging/arch/TRANSITION.md)
 
 ### `mykey-manager`
 
@@ -389,6 +472,13 @@ Last updated: 2026-04-20
 - `mykey-pin` should serve as the PIN fallback backend behind that unified auth layer
 - biometrics should be offered first, then fall back to MyKey PIN
 - elevated actions should require stronger authentication than biometrics alone
+
+### `mykey-tray` target model
+- tray stays intentionally minimal
+- tray click/menu should show concise one-word status only
+- verbose operational detail belongs in `mykey-tray status`
+- tray auth state should come from daemon-owned local-auth policy, not just helper-binary presence
+- the tray should not claim MyKey is managing auth until supported PAM paths are verifiably routed through MyKey
 
 ### Level 1 boundary
 - architecture first

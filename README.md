@@ -23,7 +23,7 @@ At a high level, MyKey aims to give Linux users:
 - 🧠 TPM-sealed secret storage
 - 🗝️ a Secret Service provider
 - 🔄 a migration path from existing keyrings
-- 🌐 browser integration for WebAuthn
+- 🔑 future cross-platform passkey and authenticator support
 - 🔢 a Windows Hello–style local PIN path
 
 **Simple to use. Serious about security. Built for Linux first.**
@@ -59,14 +59,13 @@ It handles:
 - secure policy checks
 - privileged operations used by the rest of MyKey
 
-### 🔌 `mykey-host`
-The native messaging host that connects the browser extension to the local system.
-
-### 🌐 `mykey-proxy`
-The browser extension used for WebAuthn flows.
-
 ### 🖥️ `mykey-tray`
-A tray app for status and quick interaction.
+An optional tray app for status and quick interaction.
+
+It is managed through:
+- `mykey-tray enable`
+- `mykey-tray disable`
+- `mykey-tray status`
 
 ### 🗝️ `mykey-secrets`
 A Secret Service provider backed by MyKey’s hardware-focused design.
@@ -92,6 +91,15 @@ It currently contains:
 - `mykey-pam` for the PAM-facing local auth layer
 - `mykey-pin` for PIN management and fallback auth
 - `mykey-biometrics` as the planned home for biometric setup and policy
+
+Current Phase A management commands:
+- `mykey-pin set` to configure the MyKey PIN policy
+- `sudo mykey-auth enable` to place MyKey first for supported elevation prompts and then optionally hand off to login setup
+- `sudo mykey-auth biometrics` to drive biometric enrollment, provider setup, and active backend selection
+- `sudo mykey-auth login` to opt into MyKey-managed login and unlock PAM targets
+- `sudo mykey-auth disable` to remove the base MyKey-managed PAM entries and then walk login teardown
+- `sudo mykey-auth logout` to remove MyKey-managed login and unlock PAM targets
+- `mykey-auth status` to inspect local-auth policy plus base/login PAM integration state
 
 ### 🎛️ `mykey-manager`
 A planned GUI frontend for managing MyKey features from one place.
@@ -151,11 +159,10 @@ If the platform configuration drifts too far from the expected model, sealed dat
 
 MyKey is in active development and moving toward its first release.
 
-The core platform is no longer just an idea. Several major pieces are already working together, including TPM-backed operations, browser integration, Secret Service support, and secret migration.
+The core platform is no longer just an idea. Several major pieces are already working together, including TPM-backed operations, Secret Service support, secret migration, and daemon-owned local authentication.
 
 ### ✅ What is working now
-- TPM-backed daemon and native host architecture
-- WebAuthn flow through Chromium-based browsers
+- TPM-backed daemon architecture
 - Secret Service provider support through `mykey-secrets`
 - bidirectional secret migration with `mykey-migrate`
 - Secure Boot and platform prerequisite validation in the installer
@@ -168,6 +175,7 @@ These are the main items still being refined before MyKey feels ready for a firs
 
 - final `mykey-pin` policy and user experience
 - biometric-first local authentication with PIN fallback
+- re-scoping passkey work around a native cross-platform authenticator path
 - cleanup of remaining brute-force behavior so it only affects MyKey PIN flows
 - packaging and release polish
 - clearer documentation for setup, fallback, and supported system requirements
@@ -194,6 +202,7 @@ These are the first-release and shortly-after-release goals:
 - finalize MyKey PIN policy and local auth behavior
 - add biometric-first local auth using supported Linux biometric frontends
 - improve packaging and installation experience
+- define the first cross-platform authenticator and passkey storage path
 - publish clearer user-facing documentation
 - prepare AUR packaging
 
@@ -204,6 +213,7 @@ These are the next meaningful platform improvements after the first release is s
 - explore optional TOTP-based recovery flows
 - improve onboarding and management through the GUI
 - refine desktop integration and service management
+- research legitimate Linux platform-authenticator integration as a long-term browser patch path, not a release feature
 - continue hardening and validation across supported environments
 
 ### 🚀 Long-term
@@ -211,6 +221,7 @@ These are the bigger platform goals that move MyKey closer to a full Windows Hel
 
 - evolve MyKey PIN beyond the current sealed-verifier model toward a stronger TPM-backed local auth design
 - broaden supported authentication flows while keeping them local and hardware-aware
+- support device-bound cross-platform passkeys without turning MyKey into a syncing password manager
 - improve distribution options beyond source install
 - revisit Firefox support if browser platform support becomes practical
 - continue building toward a more complete Linux authentication platform, not just a collection of tools
@@ -231,7 +242,6 @@ The installer currently handles:
 - signed boot file checks
 - build and install steps
 - MyKey secret migration
-- browser extension setup
 - final health checks
 
 > ⚠️ The installer is still evolving. Expect some changes while the first release is being prepared.
@@ -251,10 +261,6 @@ This removes the installed MyKey components and restores your previous Secret Se
 ## 🧪 Testing
 
 Current real-world testing has focused on:
-
-### 🌐 WebAuthn
-- Chromium-based browser flows
-- registration and sign-in testing
 
 ### 🗝️ Secret management
 - migration to and from GNOME Keyring

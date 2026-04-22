@@ -135,9 +135,7 @@ impl PinStore {
 
         let temp_path = parent.join(format!(
             ".{}.tmp-{}-{}",
-            path.file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("pin"),
+            path.file_name().and_then(|s| s.to_str()).unwrap_or("pin"),
             std::process::id(),
             now_nanos(),
         ));
@@ -260,7 +258,9 @@ mod tests {
         let root = TestRoot::new();
         let store = root.store();
 
-        store.write_pin_blob(1000, b"alpha").expect("write uid 1000");
+        store
+            .write_pin_blob(1000, b"alpha")
+            .expect("write uid 1000");
         store.write_pin_blob(1001, b"beta").expect("write uid 1001");
 
         assert_eq!(
@@ -279,25 +279,48 @@ mod tests {
         let root = TestRoot::new();
         let store = root.store();
 
-        assert_eq!(store.read_attempts(1000).expect("initial attempts"), AttemptsState::default());
+        assert_eq!(
+            store.read_attempts(1000).expect("initial attempts"),
+            AttemptsState::default()
+        );
         let state = store.record_failed_attempt(1000).expect("failed attempt");
         assert_eq!(state.failed_sessions, 1);
-        assert_eq!(store.lockout_remaining(1000).expect("lockout remaining"), None);
-        assert_eq!(store.read_attempts(1001).expect("other user"), AttemptsState::default());
-
-        store.record_failed_attempt(1000).expect("second failed attempt");
-        store.record_failed_attempt(1000).expect("third failed attempt");
         assert_eq!(
-            store.lockout_remaining(1000).expect("lockout before threshold"),
+            store.lockout_remaining(1000).expect("lockout remaining"),
+            None
+        );
+        assert_eq!(
+            store.read_attempts(1001).expect("other user"),
+            AttemptsState::default()
+        );
+
+        store
+            .record_failed_attempt(1000)
+            .expect("second failed attempt");
+        store
+            .record_failed_attempt(1000)
+            .expect("third failed attempt");
+        assert_eq!(
+            store
+                .lockout_remaining(1000)
+                .expect("lockout before threshold"),
             None
         );
 
-        let state = store.record_failed_attempt(1000).expect("fourth failed attempt");
+        let state = store
+            .record_failed_attempt(1000)
+            .expect("fourth failed attempt");
         assert_eq!(state.failed_sessions, 4);
-        assert!(store.lockout_remaining(1000).expect("lockout at threshold").is_some());
+        assert!(store
+            .lockout_remaining(1000)
+            .expect("lockout at threshold")
+            .is_some());
 
         store.record_success(1000).expect("record success");
-        assert_eq!(store.read_attempts(1000).expect("reset attempts"), AttemptsState::default());
+        assert_eq!(
+            store.read_attempts(1000).expect("reset attempts"),
+            AttemptsState::default()
+        );
         assert_eq!(store.lockout_remaining(1000).expect("reset lockout"), None);
     }
 
@@ -328,6 +351,9 @@ mod tests {
 
         assert_eq!(store.pin_is_set(1000).expect("pin status"), false);
         assert_eq!(store.read_pin_blob(1000).expect("pin blob"), None);
-        assert_eq!(store.read_attempts(1000).expect("attempts"), AttemptsState::default());
+        assert_eq!(
+            store.read_attempts(1000).expect("attempts"),
+            AttemptsState::default()
+        );
     }
 }

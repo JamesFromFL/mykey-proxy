@@ -64,12 +64,16 @@ pub fn unseal_key(credential_id_hex: &str) -> Result<Zeroizing<Vec<u8>>, String>
         .map_err(|e| format!("Invalid JSON in sealed blob: {e}"))?;
 
     let pub_bytes = hex::decode(
-        json["public"].as_str().ok_or("Missing 'public' field in sealed blob")?,
+        json["public"]
+            .as_str()
+            .ok_or("Missing 'public' field in sealed blob")?,
     )
     .map_err(|e| format!("Invalid hex in 'public': {e}"))?;
 
     let priv_bytes = hex::decode(
-        json["private"].as_str().ok_or("Missing 'private' field in sealed blob")?,
+        json["private"]
+            .as_str()
+            .ok_or("Missing 'private' field in sealed blob")?,
     )
     .map_err(|e| format!("Invalid hex in 'private': {e}"))?;
 
@@ -124,8 +128,7 @@ pub fn unseal_key(credential_id_hex: &str) -> Result<Zeroizing<Vec<u8>>, String>
     let hex_str = std::str::from_utf8(&hex_bytes)
         .map_err(|_| "Key file is not valid UTF-8".to_string())?
         .trim();
-    let key =
-        hex::decode(hex_str).map_err(|e| format!("Key file contains invalid hex: {e}"))?;
+    let key = hex::decode(hex_str).map_err(|e| format!("Key file contains invalid hex: {e}"))?;
 
     Ok(Zeroizing::new(key))
 }
@@ -248,8 +251,7 @@ pub fn unseal_blob(blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     if blob.len() < 4 {
         return Err("Blob too short: missing length prefix".to_string());
     }
-    let sealed_key_len =
-        u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
+    let sealed_key_len = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
     if blob.len() < 4 + sealed_key_len + 12 {
         return Err("Blob too short: truncated sealed key or nonce".to_string());
     }
@@ -258,14 +260,18 @@ pub fn unseal_blob(blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     let ciphertext = &blob[4 + sealed_key_len + 12..];
 
     // 2. TPM2-unseal the AES key.
-    let json: serde_json::Value = serde_json::from_slice(sealed_key)
-        .map_err(|e| format!("Invalid sealed-key JSON: {e}"))?;
+    let json: serde_json::Value =
+        serde_json::from_slice(sealed_key).map_err(|e| format!("Invalid sealed-key JSON: {e}"))?;
     let pub_bytes = hex::decode(
-        json["public"].as_str().ok_or("Missing 'public' in sealed key")?,
+        json["public"]
+            .as_str()
+            .ok_or("Missing 'public' in sealed key")?,
     )
     .map_err(|e| format!("Invalid hex in 'public': {e}"))?;
     let priv_bytes = hex::decode(
-        json["private"].as_str().ok_or("Missing 'private' in sealed key")?,
+        json["private"]
+            .as_str()
+            .ok_or("Missing 'private' in sealed key")?,
     )
     .map_err(|e| format!("Invalid hex in 'private': {e}"))?;
     let aes_key = tpm_unseal(&pub_bytes, &priv_bytes)?;
@@ -292,8 +298,7 @@ pub fn unseal_blob(blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     if blob.len() < 4 {
         return Err("Blob too short: missing length prefix".to_string());
     }
-    let sealed_key_len =
-        u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
+    let sealed_key_len = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
     if blob.len() < 4 + sealed_key_len + 12 {
         return Err("Blob too short: truncated sealed key or nonce".to_string());
     }
@@ -329,10 +334,10 @@ mod tpm2_impl {
             session_handles::{AuthSession, PolicySession},
         },
         structures::{
-            Digest, KeyedHashScheme, PcrSelectionList, PcrSelectionListBuilder, PcrSlot,
-            Private, Public, PublicBuilder, PublicKeyRsa, PublicKeyedHashParameters,
-            PublicRsaParametersBuilder, RsaExponent, RsaScheme, SensitiveData,
-            SymmetricDefinition, SymmetricDefinitionObject,
+            Digest, KeyedHashScheme, PcrSelectionList, PcrSelectionListBuilder, PcrSlot, Private,
+            Public, PublicBuilder, PublicKeyRsa, PublicKeyedHashParameters,
+            PublicRsaParametersBuilder, RsaExponent, RsaScheme, SensitiveData, SymmetricDefinition,
+            SymmetricDefinitionObject,
         },
         traits::{Marshall, UnMarshall},
         Context, TctiNameConf,
@@ -369,9 +374,7 @@ mod tpm2_impl {
             .with_public_algorithm(PublicAlgorithm::KeyedHash)
             .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
             .with_object_attributes(sealed_attrs)
-            .with_keyed_hash_parameters(PublicKeyedHashParameters::new(
-                KeyedHashScheme::Null,
-            ))
+            .with_keyed_hash_parameters(PublicKeyedHashParameters::new(KeyedHashScheme::Null))
             .with_keyed_hash_unique_identifier(Digest::default())
             .with_auth_policy(policy_digest)
             .build()
@@ -403,23 +406,18 @@ mod tpm2_impl {
     /// Fails with a clear error if PCR 0 or PCR 7 values have changed since
     /// sealing — indicating firmware or Secure Boot configuration tampering.
     /// All TPM sessions are flushed before returning.
-    pub fn tpm_unseal(
-        pub_bytes: &[u8],
-        priv_bytes: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, String> {
+    pub fn tpm_unseal(pub_bytes: &[u8], priv_bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
         let mut ctx = connect()?;
 
-        let out_public = Public::unmarshall(pub_bytes)
-            .map_err(|e| format!("Unmarshal TPM2B_PUBLIC: {e}"))?;
+        let out_public =
+            Public::unmarshall(pub_bytes).map_err(|e| format!("Unmarshal TPM2B_PUBLIC: {e}"))?;
         let out_private = Private::try_from(priv_bytes.to_vec())
             .map_err(|e| format!("Reconstruct TPM2B_PRIVATE: {e}"))?;
 
         let srk = create_srk(&mut ctx)?;
 
         let load_handle = ctx
-            .execute_with_nullauth_session(|ctx| {
-                ctx.load(srk, out_private, out_public)
-            })
+            .execute_with_nullauth_session(|ctx| ctx.load(srk, out_private, out_public))
             .map_err(|e| format!("TPM2_Load (sealed object): {e}"))?;
 
         // Start a real (non-trial) policy session and assert PCR 0 + 7.
@@ -473,8 +471,7 @@ mod tpm2_impl {
     // -----------------------------------------------------------------------
 
     fn connect() -> Result<Context, String> {
-        let tcti = TctiNameConf::from_str(TCTI)
-            .map_err(|e| format!("TCTI parse error: {e}"))?;
+        let tcti = TctiNameConf::from_str(TCTI).map_err(|e| format!("TCTI parse error: {e}"))?;
         Context::new(tcti).map_err(|e| format!("TPM context error: {e}"))
     }
 

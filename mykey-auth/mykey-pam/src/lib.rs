@@ -13,10 +13,7 @@ use std::process::{Command, Stdio};
 
 use zeroize::Zeroizing;
 
-const AUTH_HELPER_CANDIDATES: &[&str] = &[
-    "/usr/local/bin/mykey-auth",
-    "/usr/bin/mykey-auth",
-];
+const AUTH_HELPER_CANDIDATES: &[&str] = &["/usr/local/bin/mykey-auth", "/usr/bin/mykey-auth"];
 
 mod pam_ffi {
     use libc::{c_char, c_int, c_void};
@@ -177,73 +174,100 @@ enum HelperAuthResult {
     Success,
     AuthFailed,
     Locked(String),
-    NotConfigured(String),
+    NotConfigured,
+    Error(String),
+}
+
+enum HelperPreflightResult {
+    Ready,
+    Ignore,
+    Locked(String),
     Error(String),
 }
 
 fn run_auth_helper(uid: u32, pin: &[u8]) -> HelperAuthResult {
+    match run_helper_command(
+        &["authenticate", "--uid", &uid.to_string(), "--pin-stdin"],
+        Some(pin),
+    ) {
+        Ok((Some(0), _)) => HelperAuthResult::Success,
+        Ok((Some(1), _)) => HelperAuthResult::AuthFailed,
+        Ok((Some(3), stderr)) => HelperAuthResult::Locked(stderr),
+        Ok((Some(4), _)) => HelperAuthResult::NotConfigured,
+        Ok((Some(2), stderr)) => HelperAuthResult::Error(stderr),
+        Ok((Some(code), _)) => {
+            HelperAuthResult::Error(format!("mykey-auth exited unexpectedly with status {code}"))
+        }
+        Ok((None, _)) => {
+            HelperAuthResult::Error("mykey-auth terminated without an exit status".to_string())
+        }
+        Err(e) => HelperAuthResult::Error(e),
+    }
+}
+
+fn run_preflight_helper(uid: u32) -> HelperPreflightResult {
+    match run_helper_command(&["preflight", "--uid", &uid.to_string()], None) {
+        Ok((Some(0), _)) => HelperPreflightResult::Ready,
+        Ok((Some(4), _)) => HelperPreflightResult::Ignore,
+        Ok((Some(3), stderr)) => HelperPreflightResult::Locked(stderr),
+        Ok((Some(2), stderr)) => HelperPreflightResult::Error(stderr),
+        Ok((Some(code), _)) => HelperPreflightResult::Error(format!(
+            "mykey-auth exited unexpectedly with status {code}"
+        )),
+        Ok((None, _)) => {
+            HelperPreflightResult::Error("mykey-auth terminated without an exit status".to_string())
+        }
+        Err(e) => HelperPreflightResult::Error(e),
+    }
+}
+
+fn run_helper_command(
+    args: &[&str],
+    stdin_data: Option<&[u8]>,
+) -> Result<(Option<i32>, String), String> {
     let helper_path = match resolve_auth_helper_path() {
         Some(path) => path,
         None => {
-            return HelperAuthResult::Error(
-                "Could not find an installed mykey-auth helper.".to_string(),
-            );
+            return Err("Could not find an installed mykey-auth helper.".to_string());
         }
     };
 
     let mut child = match Command::new(helper_path)
-        .args(["authenticate", "--uid", &uid.to_string(), "--pin-stdin"])
-        .stdin(Stdio::piped())
+        .args(args)
+        .stdin(if stdin_data.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
     {
         Ok(child) => child,
-        Err(e) => {
-            return HelperAuthResult::Error(format!("Could not launch mykey-auth: {e}"));
-        }
+        Err(e) => return Err(format!("Could not launch mykey-auth: {e}")),
     };
 
-    if let Some(stdin) = child.stdin.as_mut() {
-        if let Err(e) = stdin.write_all(pin) {
+    if let Some(pin) = stdin_data {
+        if let Some(stdin) = child.stdin.as_mut() {
+            if let Err(e) = stdin.write_all(pin) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Could not send PIN to mykey-auth: {e}"));
+            }
+        } else {
             let _ = child.kill();
             let _ = child.wait();
-            return HelperAuthResult::Error(format!(
-                "Could not send PIN to mykey-auth: {e}"
-            ));
+            return Err("mykey-auth did not expose a writable stdin".to_string());
         }
-    } else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return HelperAuthResult::Error(
-            "mykey-auth did not expose a writable stdin".to_string(),
-        );
     }
 
     let output = match child.wait_with_output() {
         Ok(output) => output,
-        Err(e) => {
-            return HelperAuthResult::Error(format!(
-                "Failed waiting for mykey-auth: {e}"
-            ));
-        }
+        Err(e) => return Err(format!("Failed waiting for mykey-auth: {e}")),
     };
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-
-    match output.status.code() {
-        Some(0) => HelperAuthResult::Success,
-        Some(1) => HelperAuthResult::AuthFailed,
-        Some(3) => HelperAuthResult::Locked(stderr),
-        Some(4) => HelperAuthResult::NotConfigured(stderr),
-        Some(2) => HelperAuthResult::Error(stderr),
-        Some(code) => HelperAuthResult::Error(format!(
-            "mykey-auth exited unexpectedly with status {code}"
-        )),
-        None => HelperAuthResult::Error(
-            "mykey-auth terminated without an exit status".to_string(),
-        ),
-    }
+    Ok((output.status.code(), stderr))
 }
 
 fn resolve_auth_helper_path() -> Option<&'static str> {
@@ -260,11 +284,7 @@ unsafe fn pam_error(handle: &pam::PamHandle, msg: &str) {
 pub struct MyKeyModule;
 
 impl PamModule for MyKeyModule {
-    fn authenticate(
-        handle: &pam::PamHandle,
-        _args: Vec<&CStr>,
-        _flags: c_uint,
-    ) -> PamReturnCode {
+    fn authenticate(handle: &pam::PamHandle, _args: Vec<&CStr>, _flags: c_uint) -> PamReturnCode {
         let username = unsafe {
             match pam_user(handle) {
                 Some(user) => user,
@@ -288,6 +308,24 @@ impl PamModule for MyKeyModule {
             }
         };
 
+        match run_preflight_helper(uid) {
+            HelperPreflightResult::Ready => {}
+            HelperPreflightResult::Ignore => return PamReturnCode::Ignore,
+            HelperPreflightResult::Locked(msg) | HelperPreflightResult::Error(msg) => {
+                unsafe {
+                    pam_error(
+                        handle,
+                        if msg.is_empty() {
+                            "MyKey authentication failed."
+                        } else {
+                            &msg
+                        },
+                    );
+                }
+                return PamReturnCode::Auth_Err;
+            }
+        }
+
         let entered_pin = unsafe {
             match pam_converse(handle, pam_ffi::PAM_PROMPT_ECHO_OFF, "MyKey PIN: ") {
                 Some(pin) => Zeroizing::new(pin),
@@ -303,9 +341,8 @@ impl PamModule for MyKeyModule {
                 }
                 PamReturnCode::Auth_Err
             }
-            HelperAuthResult::Locked(msg)
-            | HelperAuthResult::NotConfigured(msg)
-            | HelperAuthResult::Error(msg) => {
+            HelperAuthResult::NotConfigured => PamReturnCode::Ignore,
+            HelperAuthResult::Locked(msg) | HelperAuthResult::Error(msg) => {
                 unsafe {
                     pam_error(
                         handle,

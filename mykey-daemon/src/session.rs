@@ -4,9 +4,9 @@
 // Tokens are kept in a heap-allocated, mlocked buffer so they are never
 // swapped to disk.  All token memory is zeroized on drop.
 
-use std::collections::HashMap;
 use log::{debug, warn};
 use rand::RngCore;
+use std::collections::HashMap;
 use tokio::sync::RwLock;
 use zeroize::Zeroizing;
 
@@ -106,4 +106,3 @@ impl SessionStore {
         self.tokens.read().await.len()
     }
 }
-

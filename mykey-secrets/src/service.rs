@@ -40,25 +40,15 @@ pub struct ServiceInterface {
     /// Active sessions keyed by UUID.  Arc so SessionInterface instances can
     /// call remove() when Close() is invoked by the client.
     sessions: Arc<Mutex<SessionStore>>,
-    /// Object paths of all registered collections.
-    collections: Vec<OwnedObjectPath>,
-    /// Named alias mappings (e.g. "default" → collection path).
-    aliases: HashMap<String, OwnedObjectPath>,
     /// Shared connection, populated after startup.  Used to register
     /// SessionInterface and CollectionInterface objects at runtime.
     pub conn: Arc<OnceLock<zbus::Connection>>,
 }
 
 impl ServiceInterface {
-    pub fn new(
-        collections: Vec<OwnedObjectPath>,
-        aliases: HashMap<String, OwnedObjectPath>,
-        conn: Arc<OnceLock<zbus::Connection>>,
-    ) -> Self {
+    pub fn new(conn: Arc<OnceLock<zbus::Connection>>) -> Self {
         ServiceInterface {
             sessions: Arc::new(Mutex::new(SessionStore::new())),
-            collections,
-            aliases,
             conn,
         }
     }
@@ -90,7 +80,16 @@ impl ServiceInterface {
     /// All collections currently registered with this service.
     #[zbus(property)]
     fn collections(&self) -> Vec<OwnedObjectPath> {
-        self.collections.clone()
+        storage::load_collections()
+            .into_iter()
+            .filter_map(|c| {
+                OwnedObjectPath::try_from(format!(
+                    "/org/freedesktop/secrets/collection/{}",
+                    c.id
+                ))
+                .ok()
+            })
+            .collect()
     }
 
     // ── Signals ──────────────────────────────────────────────────────────────
@@ -173,7 +172,7 @@ impl ServiceInterface {
         &self,
         attributes: HashMap<String, String>,
     ) -> (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) {
-        info!("[service] SearchItems {:?}", attributes);
+        info!("[service] SearchItems attr_count={}", attributes.len());
         let mut unlocked: Vec<OwnedObjectPath> = Vec::new();
         for col in storage::load_collections() {
             for item in storage::load_items(&col.id) {
@@ -320,7 +319,10 @@ impl ServiceInterface {
             slugify(&label)
         };
 
-        info!("[service] CreateCollection label={label:?} id={col_id} alias={alias:?}");
+        info!(
+            "[service] CreateCollection alias_present={}",
+            !alias.is_empty()
+        );
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -344,10 +346,6 @@ impl ServiceInterface {
         // Build and register the CollectionInterface.
         let col_iface = crate::collection::CollectionInterface {
             id: col_id.clone(),
-            label,
-            created: now,
-            modified: now,
-            item_paths: Vec::new(),
             conn: Arc::clone(&self.conn),
         };
 
@@ -359,16 +357,11 @@ impl ServiceInterface {
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("Register collection on D-Bus: {e}")))?;
 
-        self.collections.push(col_path.clone());
-
         // Handle alias if provided.
         if !alias.is_empty() {
-            self.aliases.insert(alias.clone(), col_path.clone());
-            let raw: HashMap<String, String> = self.aliases
-                .iter()
-                .map(|(k, v)| (k.clone(), v.as_str().to_owned()))
-                .collect();
-            if let Err(e) = storage::save_aliases(&raw) {
+            let mut aliases = storage::load_aliases();
+            aliases.insert(alias.clone(), col_path.as_str().to_owned());
+            if let Err(e) = storage::save_aliases(&aliases) {
                 warn!("[service] CreateCollection: failed to persist alias {alias:?}: {e}");
             }
         }
@@ -394,29 +387,30 @@ impl ServiceInterface {
     /// Looks up the alias in the in-memory map (loaded from disk at startup
     /// and kept up-to-date by SetAlias).  Returns "/" if not found.
     async fn read_alias(&self, name: String) -> OwnedObjectPath {
-        info!("[service] ReadAlias name={name}");
-        self.aliases
+        info!("[service] ReadAlias");
+        storage::load_aliases()
             .get(&name)
-            .cloned()
+            .and_then(|path| OwnedObjectPath::try_from(path.as_str()).ok())
             .unwrap_or_else(|| OwnedObjectPath::try_from("/").unwrap())
     }
 
     /// Persist a named alias for a collection.
     ///
-    /// Updates the in-memory map and writes the full alias table to
-    /// /etc/mykey/provider/aliases.json.
+    /// Updates the in-memory map and writes the full alias table to the
+    /// user's on-disk alias table.
     async fn set_alias(
         &mut self,
         name: String,
         collection: OwnedObjectPath,
     ) -> Result<(), zbus::fdo::Error> {
-        info!("[service] SetAlias name={name} collection={}", collection.as_str());
-        self.aliases.insert(name, collection);
-        let raw: HashMap<String, String> = self.aliases
-            .iter()
-            .map(|(k, v)| (k.clone(), v.as_str().to_owned()))
-            .collect();
-        if let Err(e) = storage::save_aliases(&raw) {
+        info!("[service] SetAlias clear={}", collection.as_str() == "/");
+        let mut aliases = storage::load_aliases();
+        if collection.as_str() == "/" {
+            aliases.remove(&name);
+        } else {
+            aliases.insert(name, collection.as_str().to_owned());
+        }
+        if let Err(e) = storage::save_aliases(&aliases) {
             warn!("[service] set_alias: failed to persist aliases: {e}");
         }
         Ok(())

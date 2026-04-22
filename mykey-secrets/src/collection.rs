@@ -11,16 +11,11 @@ use zbus::zvariant::{OwnedObjectPath, Value};
 
 use crate::item::ItemInterface;
 use crate::service::SecretStruct;
-use crate::storage::{self, StoredCollection, StoredItem};
+use crate::storage::{self, StoredItem};
 
 /// Implements org.freedesktop.Secret.Collection for a single collection.
 pub struct CollectionInterface {
     pub id: String,
-    pub label: String,
-    pub created: u64,
-    pub modified: u64,
-    /// Object paths of items belonging to this collection.
-    pub item_paths: Vec<OwnedObjectPath>,
     /// Shared connection, populated after startup, used to register new items.
     pub conn: Arc<OnceLock<zbus::Connection>>,
 }
@@ -31,12 +26,24 @@ impl CollectionInterface {
 
     #[zbus(property)]
     fn items(&self) -> Vec<OwnedObjectPath> {
-        self.item_paths.clone()
+        storage::load_items(&self.id)
+            .into_iter()
+            .filter_map(|item| {
+                let safe_id = item.id.replace('-', "_");
+                OwnedObjectPath::try_from(format!(
+                    "/org/freedesktop/secrets/collection/{}/{}",
+                    self.id, safe_id
+                ))
+                .ok()
+            })
+            .collect()
     }
 
     #[zbus(property)]
-    fn label(&self) -> &str {
-        &self.label
+    fn label(&self) -> String {
+        storage::load_collection(&self.id)
+            .map(|c| c.label)
+            .unwrap_or_default()
     }
 
     #[zbus(property)]
@@ -46,12 +53,16 @@ impl CollectionInterface {
 
     #[zbus(property)]
     fn created(&self) -> u64 {
-        self.created
+        storage::load_collection(&self.id)
+            .map(|c| c.created)
+            .unwrap_or_default()
     }
 
     #[zbus(property)]
     fn modified(&self) -> u64 {
-        self.modified
+        storage::load_collection(&self.id)
+            .map(|c| c.modified)
+            .unwrap_or_default()
     }
 
     // ── Signals ──────────────────────────────────────────────────────────────
@@ -109,6 +120,28 @@ impl CollectionInterface {
             warn!("[collection] Delete: failed to remove collection dir: {e}");
         }
 
+        // Remove any aliases that still point at this collection. If the
+        // default alias pointed here, best-effort reassign it to another live
+        // collection so clients do not keep a stale path.
+        let mut aliases = storage::load_aliases();
+        let deleted_path = format!("/org/freedesktop/secrets/collection/{}", self.id);
+        let default_was_deleted = aliases.get("default") == Some(&deleted_path);
+        aliases.retain(|_, path| path != &deleted_path);
+        if default_was_deleted {
+            if let Some(replacement) = storage::load_collections()
+                .into_iter()
+                .find(|c| c.id != self.id)
+            {
+                aliases.insert(
+                    "default".to_string(),
+                    format!("/org/freedesktop/secrets/collection/{}", replacement.id),
+                );
+            }
+        }
+        if let Err(e) = storage::save_aliases(&aliases) {
+            warn!("[collection] Delete: failed to persist aliases: {e}");
+        }
+
         // Build the collection path before unregistering (needed for the signal).
         let col_path_str = format!("/org/freedesktop/secrets/collection/{}", self.id);
         let col_path = OwnedObjectPath::try_from(col_path_str.as_str())
@@ -146,7 +179,11 @@ impl CollectionInterface {
         &self,
         attributes: HashMap<String, String>,
     ) -> Vec<OwnedObjectPath> {
-        info!("[collection:{}] SearchItems {:?}", self.id, attributes);
+        info!(
+            "[collection:{}] SearchItems attr_count={}",
+            self.id,
+            attributes.len()
+        );
         let results: Vec<OwnedObjectPath> = storage::load_items(&self.id)
             .into_iter()
             .filter(|item| {
@@ -237,6 +274,8 @@ impl CollectionInterface {
                     "[collection] CreateItem replacing existing item={} in collection={}",
                     existing_item.id, self.id
                 );
+                existing_item.label = label;
+                existing_item.attributes = attributes;
                 existing_item.sealed_value = sealed;
                 existing_item.content_type = secret.content_type;
                 existing_item.modified = now;
@@ -244,13 +283,7 @@ impl CollectionInterface {
                     .map_err(|e| zbus::fdo::Error::Failed(format!("Save item: {e}")))?;
 
                 // Update the collection's modified timestamp on disk.
-                self.modified = now;
-                if let Err(e) = storage::save_collection(&StoredCollection {
-                    id: self.id.clone(),
-                    label: self.label.clone(),
-                    created: self.created,
-                    modified: now,
-                }) {
+                if let Err(e) = storage::update_collection_modified(&self.id, now) {
                     warn!("[collection] Failed to update collection modified time: {e}");
                 }
 
@@ -261,6 +294,18 @@ impl CollectionInterface {
                     self.id, safe_id
                 ))
                 .map_err(|e| zbus::fdo::Error::Failed(format!("Bad item path: {e}")))?;
+
+                if let Some(conn) = conn_arc.get() {
+                    let col_path = format!("/org/freedesktop/secrets/collection/{}", self.id);
+                    match zbus::SignalContext::new(conn, col_path.as_str()) {
+                        Ok(signal_ctxt) => {
+                            if let Err(e) = CollectionInterface::item_changed(&signal_ctxt, item_path.clone()).await {
+                                warn!("[collection] ItemChanged signal failed: {e}");
+                            }
+                        }
+                        Err(e) => warn!("[collection] Could not build signal context for ItemChanged: {e}"),
+                    }
+                }
 
                 let prompt_path = OwnedObjectPath::try_from("/").unwrap();
                 return Ok((item_path, prompt_path));
@@ -292,13 +337,7 @@ impl CollectionInterface {
             .map_err(|e| zbus::fdo::Error::Failed(format!("Save item: {e}")))?;
 
         // Update the collection's modified timestamp on disk.
-        self.modified = now;
-        if let Err(e) = storage::save_collection(&StoredCollection {
-            id: self.id.clone(),
-            label: self.label.clone(),
-            created: self.created,
-            modified: now,
-        }) {
+        if let Err(e) = storage::update_collection_modified(&self.id, now) {
             warn!("[collection] Failed to update collection modified time: {e}");
         }
 
@@ -326,7 +365,6 @@ impl CollectionInterface {
 
         let item_path = OwnedObjectPath::try_from(item_path_str)
             .map_err(|e| zbus::fdo::Error::Failed(format!("Bad item path: {e}")))?;
-        self.item_paths.push(item_path.clone());
 
         // Emit ItemCreated signal so clients with subscriptions are notified.
         let col_path = format!("/org/freedesktop/secrets/collection/{}", self.id);

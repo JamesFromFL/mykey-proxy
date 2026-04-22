@@ -1,0 +1,5 @@
+d /etc/mykey 0711 mykey mykey -
+d /etc/mykey/auth 0700 mykey mykey -
+d /etc/mykey/credentials 0700 mykey mykey -
+d /etc/mykey/keys 0700 mykey mykey -
+d /etc/mykey/pin 0700 mykey mykey -

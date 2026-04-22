@@ -4,9 +4,9 @@
 // The ReplayCache rejects requests outside a 30-second window and any sequence
 // number it has already seen.  Old entries are pruned on each check.
 
+use log::{debug, warn};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-use log::{debug, warn};
 use tokio::sync::Mutex;
 
 // ---------------------------------------------------------------------------
@@ -16,7 +16,11 @@ use tokio::sync::Mutex;
 #[derive(Debug)]
 pub enum ReplayError {
     /// Request timestamp is outside the acceptance window.
-    Expired { timestamp_secs: u64, now: u64, window: u64 },
+    Expired {
+        timestamp_secs: u64,
+        now: u64,
+        window: u64,
+    },
     /// Sequence number has already been processed.
     Replay { sequence: u64 },
 }
@@ -24,7 +28,11 @@ pub enum ReplayError {
 impl std::fmt::Display for ReplayError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReplayError::Expired { timestamp_secs, now, window } => write!(
+            ReplayError::Expired {
+                timestamp_secs,
+                now,
+                window,
+            } => write!(
                 f,
                 "request expired: timestamp={timestamp_secs} now={now} window={window}s"
             ),
@@ -102,9 +110,8 @@ impl ReplayCache {
 
     /// Remove sequence numbers whose recorded timestamp is outside the window.
     fn prune(&mut self, now: u64) {
-        self.seen.retain(|_seq, recorded_at| {
-            now.saturating_sub(*recorded_at) <= self.window_seconds
-        });
+        self.seen
+            .retain(|_seq, recorded_at| now.saturating_sub(*recorded_at) <= self.window_seconds);
     }
 
     /// Count of currently tracked sequence numbers (for diagnostics).
@@ -134,7 +141,10 @@ impl AsyncReplayCache {
         sequence: u64,
         timestamp_secs: u64,
     ) -> Result<(), ReplayError> {
-        self.inner.lock().await.check_and_record(sequence, timestamp_secs)
+        self.inner
+            .lock()
+            .await
+            .check_and_record(sequence, timestamp_secs)
     }
 
     /// Clear all seen sequence numbers.

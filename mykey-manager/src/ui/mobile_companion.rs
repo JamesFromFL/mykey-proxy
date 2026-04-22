@@ -29,12 +29,10 @@ pub fn build() -> Widget {
 
     // ── Description ───────────────────────────────────────────────────────────
     let desc = Label::new(Some(
-        "Pair MyKey Proxy with the MyKey Proxy companion app for iOS and Android \
-         to forward authentication requests to your mobile device. Approve \
-         WebAuthn requests using your phone's biometrics — Face ID, fingerprint, \
-         or PIN — as a trusted credential on your Linux desktop. Secure pairing \
-         via QR code with end-to-end encrypted communication over your local \
-         network, with an encrypted relay as fallback.",
+        "Pair MyKey with a future mobile companion for iOS and Android for \
+         device approval, setup, and recovery flows. Mobile support is not in \
+         scope for the current release and will be revisited once the native \
+         local-auth and passkey direction is settled.",
     ));
     desc.set_wrap(true);
     desc.set_wrap_mode(gtk4::pango::WrapMode::Word);

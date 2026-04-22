@@ -10,9 +10,7 @@ use serde_json::Value;
 use crate::credentials::{resolve_credential, write_credential_metadata};
 use crate::crypto_ops;
 use crate::pam;
-use crate::protocol::{
-    AssertionResponse, GetRequest, GetResponse, PublicKeyCredentialGet,
-};
+use crate::protocol::{AssertionResponse, GetRequest, GetResponse, PublicKeyCredentialGet};
 use crate::tpm;
 
 /// Handle a WebAuthn authentication request end-to-end.
@@ -29,20 +27,20 @@ pub async fn handle_get(request: GetRequest, calling_pid: u32) -> Result<GetResp
     }
 
     // ── 2. Resolve credential ─────────────────────────────────────────────
-    let meta = resolve_credential(&request)
-        .map_err(|e| format!("Credential resolution failed: {e}"))?;
+    let meta =
+        resolve_credential(&request).map_err(|e| format!("Credential resolution failed: {e}"))?;
     info!(
         "[authentication] Resolved credential id={} for rpId={}",
         meta.credential_id, request.rp_id
     );
 
     // ── 3. Unseal private key ─────────────────────────────────────────────
-    let private_key = tpm::unseal_key(&meta.credential_id)
-        .map_err(|e| format!("TPM unseal_key failed: {e}"))?;
+    let private_key =
+        tpm::unseal_key(&meta.credential_id).map_err(|e| format!("TPM unseal_key failed: {e}"))?;
 
     // ── 4. Verify rpIdHash ────────────────────────────────────────────────
     let request_rp_hash = crypto_ops::compute_rp_id_hash(&request.rp_id);
-    let stored_rp_hash  = crypto_ops::compute_rp_id_hash(&meta.rp_id);
+    let stored_rp_hash = crypto_ops::compute_rp_id_hash(&meta.rp_id);
     if request_rp_hash != stored_rp_hash {
         return Err(format!(
             "rpId mismatch: request has '{}', credential has '{}'",
@@ -52,13 +50,11 @@ pub async fn handle_get(request: GetRequest, calling_pid: u32) -> Result<GetResp
 
     // ── 5. Build authenticatorData (no attested data for authentication) ──
     let new_sign_count = meta.sign_count.saturating_add(1);
-    let auth_data =
-        crypto_ops::build_authenticator_data(&request.rp_id, new_sign_count, None);
+    let auth_data = crypto_ops::build_authenticator_data(&request.rp_id, new_sign_count, None);
 
     // ── 6. Sign assertion ─────────────────────────────────────────────────
-    let signature =
-        crypto_ops::sign_assertion(&private_key, &auth_data, &request.client_data_json)
-            .map_err(|e| format!("Assertion signing failed: {e}"))?;
+    let signature = crypto_ops::sign_assertion(&private_key, &auth_data, &request.client_data_json)
+        .map_err(|e| format!("Assertion signing failed: {e}"))?;
 
     // ── 7. Increment sign counter ─────────────────────────────────────────
     let updated_meta = crate::protocol::CredentialMeta {
@@ -86,13 +82,13 @@ pub async fn handle_get(request: GetRequest, calling_pid: u32) -> Result<GetResp
 
     Ok(GetResponse {
         response: PublicKeyCredentialGet {
-            id:     cred_id_b64.clone(),
+            id: cred_id_b64.clone(),
             raw_id: cred_id_b64,
-            type_:  "public-key".to_string(),
+            type_: "public-key".to_string(),
             response: AssertionResponse {
-                client_data_json:   crypto_ops::b64url_encode(request.client_data_json.as_bytes()),
+                client_data_json: crypto_ops::b64url_encode(request.client_data_json.as_bytes()),
                 authenticator_data: crypto_ops::b64url_encode(&auth_data),
-                signature:          crypto_ops::b64url_encode(&signature),
+                signature: crypto_ops::b64url_encode(&signature),
                 user_handle,
             },
             authenticator_attachment: "platform".to_string(),

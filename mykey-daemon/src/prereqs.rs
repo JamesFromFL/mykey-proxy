@@ -106,9 +106,8 @@ pub fn check_secure_boot() {
 
 /// Check that /dev/tpm0 and /dev/tpmrm0 exist and are accessible.
 pub fn check_tpm2_present() -> Result<(), String> {
-    let check = |path: &str| {
-        std::fs::metadata(path).map_err(|e| format!("{path} inaccessible: {e}"))
-    };
+    let check =
+        |path: &str| std::fs::metadata(path).map_err(|e| format!("{path} inaccessible: {e}"));
     check("/dev/tpm0")?;
     check("/dev/tpmrm0")?;
     Ok(())
@@ -126,12 +125,12 @@ pub fn check_tpm2_present() -> Result<(), String> {
 ///   00 00 00 01     propertyCount = 1
 pub fn check_tpm2_responsive() -> Result<(), String> {
     const CMD: [u8; 22] = [
-        0x80, 0x01,                   // TPM_ST_NO_SESSIONS
-        0x00, 0x00, 0x00, 0x16,       // commandSize = 22
-        0x00, 0x00, 0x01, 0x7A,       // TPM_CC_GetCapability
-        0x00, 0x00, 0x00, 0x06,       // TPM_CAP_TPM_PROPERTIES
-        0x00, 0x00, 0x01, 0x05,       // TPM_PT_MANUFACTURER
-        0x00, 0x00, 0x00, 0x01,       // propertyCount = 1
+        0x80, 0x01, // TPM_ST_NO_SESSIONS
+        0x00, 0x00, 0x00, 0x16, // commandSize = 22
+        0x00, 0x00, 0x01, 0x7A, // TPM_CC_GetCapability
+        0x00, 0x00, 0x00, 0x06, // TPM_CAP_TPM_PROPERTIES
+        0x00, 0x00, 0x01, 0x05, // TPM_PT_MANUFACTURER
+        0x00, 0x00, 0x00, 0x01, // propertyCount = 1
     ];
     // Expected response tag: 0x80 0x01 (TPM_ST_NO_SESSIONS)
     // Expected response code at bytes 6–9: 0x00 0x00 0x00 0x00 (TPM_RC_SUCCESS)

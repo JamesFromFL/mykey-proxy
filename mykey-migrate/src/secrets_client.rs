@@ -12,13 +12,14 @@ use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zeroize::Zeroize;
 
+use crate::paths;
+
 const SS_DEST: &str = "org.freedesktop.secrets";
 const SS_PATH: &str = "/org/freedesktop/secrets";
 const SS_IFACE: &str = "org.freedesktop.Secret.Service";
 const COL_IFACE: &str = "org.freedesktop.Secret.Collection";
 const ITEM_IFACE: &str = "org.freedesktop.Secret.Item";
 const PROP_IFACE: &str = "org.freedesktop.DBus.Properties";
-const PROVIDER_DIR: &str = "/etc/mykey/provider";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -35,7 +36,7 @@ pub struct ProviderInfo {
     pub keychain_path: Option<String>,
 }
 
-/// Provider information read back from /etc/mykey/provider/info.json.
+/// Provider information read back from the user's MyKey provider state file.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ProviderInfoFile {
     pub process_name: String,
@@ -619,7 +620,7 @@ pub fn stop_provider(info: &ProviderInfo) -> Result<(), String> {
     Ok(())
 }
 
-/// Write /etc/mykey/provider/info.json recording what was disabled.
+/// Write the user's provider info file recording what was disabled.
 ///
 /// `keychain_deleted` defaults to false and can be updated later by the
 /// caller after the user optionally removes the old keychain directory.
@@ -640,26 +641,24 @@ pub fn write_provider_info(info: &ProviderInfo) -> Result<(), String> {
         "migrated_at": migrated_at,
     });
 
-    let dir = std::path::Path::new(PROVIDER_DIR);
-    std::fs::create_dir_all(dir)
-        .map_err(|e| format!("Cannot create {PROVIDER_DIR}: {e}"))?;
-    let path = dir.join("info.json");
+    let dir = paths::provider_dir();
+    paths::ensure_private_dir(&dir)?;
+    let path = paths::provider_info_path();
     let data = serde_json::to_vec_pretty(&json)
         .map_err(|e| format!("Cannot serialise provider info: {e}"))?;
-    std::fs::write(&path, data)
-        .map_err(|e| format!("Cannot write {}: {e}", path.display()))
+    paths::write_private_file(&path, &data)
 }
 
 // ---------------------------------------------------------------------------
 // Public API — unenroll (restore + cleanup)
 // ---------------------------------------------------------------------------
 
-/// Read and parse /etc/mykey/provider/info.json written during enroll.
+/// Read and parse the user's provider info file written during enroll.
 ///
 /// Returns `Err` if the file does not exist — the caller treats this as
 /// "no migration was done, skip unenroll".
 pub fn read_provider_info() -> Result<ProviderInfoFile, String> {
-    let path = std::path::Path::new(PROVIDER_DIR).join("info.json");
+    let path = paths::provider_info_path();
     let data = std::fs::read(&path)
         .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
     serde_json::from_slice(&data)
@@ -1024,26 +1023,24 @@ pub fn list_provider_secrets() -> Result<Vec<ProviderSecretInfo>, String> {
     Ok(result)
 }
 
-/// Remove /etc/mykey/provider/info.json and the directory if it is then empty.
-///
-/// Uses `sudo rm` because /etc/mykey/ is root-owned.
+/// Remove the user's provider info file and the directory if it is then empty.
 pub fn delete_provider_info() -> Result<(), String> {
-    let path = std::path::Path::new(PROVIDER_DIR).join("info.json");
+    let path = paths::provider_info_path();
     if path.exists() {
-        let status = std::process::Command::new("sudo")
-            .args(["rm", "-f", path.to_str().unwrap_or("/etc/mykey/provider/info.json")])
-            .status()
-            .map_err(|e| format!("Cannot run sudo rm: {e}"))?;
-        if !status.success() {
-            return Err(format!("sudo rm failed for {}", path.display()));
-        }
+        std::fs::remove_file(&path)
+            .map_err(|e| format!("Cannot remove {}: {e}", path.display()))?;
     }
     // Remove the directory only if it is now empty (ignore failure — may still have aliases.json).
-    std::process::Command::new("sudo")
-        .args(["rmdir", "--ignore-fail-on-non-empty", PROVIDER_DIR])
-        .status()
-        .ok();
+    let _ = std::fs::remove_dir(paths::provider_dir());
     Ok(())
+}
+
+pub fn mark_keychain_deleted() -> Result<(), String> {
+    let mut info = read_provider_info()?;
+    info.keychain_deleted = true;
+    let data = serde_json::to_vec_pretty(&info)
+        .map_err(|e| format!("Cannot serialise provider info: {e}"))?;
+    paths::write_private_file(&paths::provider_info_path(), &data)
 }
 
 // ---------------------------------------------------------------------------

@@ -36,22 +36,30 @@ impl ItemInterface {
 
     #[zbus(property)]
     fn attributes(&self) -> HashMap<String, String> {
-        self.attributes.clone()
+        crate::storage::load_item(&self.collection_id, &self.id)
+            .map(|item| item.attributes)
+            .unwrap_or_else(|| self.attributes.clone())
     }
 
     #[zbus(property)]
-    fn label(&self) -> &str {
-        &self.label
+    fn label(&self) -> String {
+        crate::storage::load_item(&self.collection_id, &self.id)
+            .map(|item| item.label)
+            .unwrap_or_else(|| self.label.clone())
     }
 
     #[zbus(property)]
     fn created(&self) -> u64 {
-        self.created
+        crate::storage::load_item(&self.collection_id, &self.id)
+            .map(|item| item.created)
+            .unwrap_or(self.created)
     }
 
     #[zbus(property)]
     fn modified(&self) -> u64 {
-        self.modified
+        crate::storage::load_item(&self.collection_id, &self.id)
+            .map(|item| item.modified)
+            .unwrap_or(self.modified)
     }
 
     // ── Methods ──────────────────────────────────────────────────────────────
@@ -61,6 +69,13 @@ impl ItemInterface {
         info!("[item] Delete called for item={}", self.id);
         crate::storage::delete_item(&self.collection_id, &self.id)
             .map_err(|e| zbus::fdo::Error::Failed(format!("Delete failed: {e}")))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Err(e) = crate::storage::update_collection_modified(&self.collection_id, now) {
+            warn!("[item] Delete: failed to update collection modified time: {e}");
+        }
 
         // Unregister the D-Bus object so the path no longer responds after deletion.
         let safe_id = self.id.replace('-', "_");
@@ -108,8 +123,10 @@ impl ItemInterface {
                 warn!("[item] GetSecret: daemon connect failed for item={}: {e}", self.id);
                 zbus::fdo::Error::Failed(format!("Daemon connect: {e}"))
             })?;
+        let stored = crate::storage::load_item(&self.collection_id, &self.id)
+            .ok_or_else(|| zbus::fdo::Error::Failed("Stored item not found".into()))?;
         let plaintext = client
-            .unseal_secret(&self.sealed_value)
+            .unseal_secret(&stored.sealed_value)
             .await
             .map_err(|e| {
                 warn!("[item] GetSecret: unseal failed for item={}: {e}", self.id);
@@ -119,7 +136,7 @@ impl ItemInterface {
             session,
             parameters: Vec::new(),
             value: plaintext,
-            content_type: self.content_type.clone(),
+            content_type: stored.content_type,
         })
     }
 
@@ -158,6 +175,9 @@ impl ItemInterface {
         };
         crate::storage::save_item(&stored)
             .map_err(|e| zbus::fdo::Error::Failed(format!("Save item: {e}")))?;
+        if let Err(e) = crate::storage::update_collection_modified(&self.collection_id, self.modified) {
+            warn!("[item] SetSecret: failed to update collection modified time: {e}");
+        }
 
         // Emit ItemChanged signal on the parent collection (best effort).
         let safe_id = self.id.replace('-', "_");

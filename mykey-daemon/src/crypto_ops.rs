@@ -17,9 +17,9 @@ use zeroize::Zeroizing;
 /// A freshly generated P-256 credential.  Private key bytes are wrapped in
 /// `Zeroizing` so the memory is wiped when the struct is dropped.
 pub struct Keypair {
-    pub credential_id:     Vec<u8>,               // 16 random bytes
-    pub private_key_bytes: Zeroizing<Vec<u8>>,    // 32-byte P-256 scalar
-    pub cose_public_key:   Vec<u8>,               // CBOR-encoded COSE_Key
+    pub credential_id: Vec<u8>,                // 16 random bytes
+    pub private_key_bytes: Zeroizing<Vec<u8>>, // 32-byte P-256 scalar
+    pub cose_public_key: Vec<u8>,              // CBOR-encoded COSE_Key
 }
 
 /// Generate a fresh P-256 signing keypair with a random 16-byte credential ID.
@@ -40,7 +40,11 @@ pub fn generate_credential_keypair() -> Keypair {
 
     let private_key_bytes = Zeroizing::new(signing_key.to_bytes().to_vec());
 
-    Keypair { credential_id, private_key_bytes, cose_public_key: cose_key }
+    Keypair {
+        credential_id,
+        private_key_bytes,
+        cose_public_key: cose_key,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -126,17 +130,16 @@ pub fn build_authenticator_data(
         flags::UP | flags::UV
     };
 
-    let mut data = Vec::with_capacity(
-        37 + attested_data.map_or(0, |(_, id, k)| 18 + id.len() + k.len()),
-    );
+    let mut data =
+        Vec::with_capacity(37 + attested_data.map_or(0, |(_, id, k)| 18 + id.len() + k.len()));
 
-    data.extend_from_slice(&rp_id_hash);               // 32 bytes
-    data.push(flag_byte);                               // 1 byte
-    data.extend_from_slice(&sign_count.to_be_bytes());  // 4 bytes
+    data.extend_from_slice(&rp_id_hash); // 32 bytes
+    data.push(flag_byte); // 1 byte
+    data.extend_from_slice(&sign_count.to_be_bytes()); // 4 bytes
 
     if let Some((aaguid, cred_id, cose_key)) = attested_data {
-        data.extend_from_slice(aaguid);                                   // 16 bytes
-        data.extend_from_slice(&(cred_id.len() as u16).to_be_bytes());   // 2 bytes
+        data.extend_from_slice(aaguid); // 16 bytes
+        data.extend_from_slice(&(cred_id.len() as u16).to_be_bytes()); // 2 bytes
         data.extend_from_slice(cred_id);
         data.extend_from_slice(cose_key);
     }
@@ -156,15 +159,15 @@ pub fn encode_cose_public_key(x: &[u8], y: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(77);
     out.push(0xa5); // map(5)
 
-    cbor_uint(&mut out, 1);     // 1: 2  (kty = EC2)
+    cbor_uint(&mut out, 1); // 1: 2  (kty = EC2)
     cbor_uint(&mut out, 2);
-    cbor_uint(&mut out, 3);     // 3: -7  (alg = ES256)
+    cbor_uint(&mut out, 3); // 3: -7  (alg = ES256)
     cbor_neg_int(&mut out, 7);
-    cbor_neg_int(&mut out, 1);  // -1: 1  (crv = P-256)
+    cbor_neg_int(&mut out, 1); // -1: 1  (crv = P-256)
     cbor_uint(&mut out, 1);
-    cbor_neg_int(&mut out, 2);  // -2: bstr(x)
+    cbor_neg_int(&mut out, 2); // -2: bstr(x)
     cbor_bytes(&mut out, x);
-    cbor_neg_int(&mut out, 3);  // -3: bstr(y)
+    cbor_neg_int(&mut out, 3); // -3: bstr(y)
     cbor_bytes(&mut out, y);
 
     out
@@ -192,7 +195,9 @@ pub fn b64url_encode(bytes: &[u8]) -> String {
 }
 
 pub fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
-    URL_SAFE_NO_PAD.decode(s).map_err(|e| format!("base64url decode error: {e}"))
+    URL_SAFE_NO_PAD
+        .decode(s)
+        .map_err(|e| format!("base64url decode error: {e}"))
 }
 
 // ---------------------------------------------------------------------------

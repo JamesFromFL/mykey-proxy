@@ -41,7 +41,6 @@ sudo systemctl disable mykey-daemon 2>/dev/null || true
 sudo rm -f /etc/systemd/system/mykey-daemon.service
 sudo systemctl daemon-reload
 
-sudo rm -f /usr/local/bin/mykey-host
 sudo rm -f /usr/local/bin/mykey-daemon
 sudo rm -f /usr/local/bin/mykey-tray
 sudo rm -f /usr/local/bin/mykey-secrets
@@ -56,8 +55,6 @@ sudo rm -f /etc/dbus-1/system.d/com.mykey.Daemon.conf
 sudo rm -f /etc/dbus-1/session.d/org.freedesktop.secrets.conf
 sudo rm -f /etc/sudoers.d/mykey
 sudo rm -f /usr/share/polkit-1/actions/com.mykey.authenticate.policy
-sudo rm -f /etc/opt/chrome/native-messaging-hosts/com.mykey.host.json
-sudo rm -f /etc/chromium/native-messaging-hosts/com.mykey.host.json
 sudo rm -rf /etc/mykey/
 sudo userdel mykey 2>/dev/null || true
 

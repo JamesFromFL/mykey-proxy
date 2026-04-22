@@ -13,11 +13,21 @@ use zbus::{CacheProperties, Connection};
 )]
 trait DaemonIface {
     async fn connect(&self, pid: u32) -> zbus::Result<Vec<u8>>;
+    async fn confirm_user_presence(&self, pid: u32) -> zbus::Result<bool>;
     async fn local_auth_status(
         &self,
         pid: u32,
         target_uid: u32,
     ) -> zbus::Result<(bool, String, bool, String)>;
+    async fn seal_secret(&self, pid: u32, data: Vec<u8>) -> zbus::Result<Vec<u8>>;
+    async fn unseal_secret(&self, pid: u32, blob: Vec<u8>) -> zbus::Result<Vec<u8>>;
+    async fn enable_biometric_backend(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        backend: String,
+    ) -> zbus::Result<()>;
+    async fn disable_biometric_backend(&self, pid: u32, target_uid: u32) -> zbus::Result<()>;
     async fn pin_status(&self, pid: u32, target_uid: u32) -> zbus::Result<(bool, u64, u32)>;
     async fn pin_verify(&self, pid: u32, target_uid: u32, pin: Vec<u8>) -> zbus::Result<bool>;
     async fn disconnect(&self, pid: u32) -> zbus::Result<()>;
@@ -101,6 +111,55 @@ impl DaemonClient {
                 Some(biometric_backend)
             },
         })
+    }
+
+    pub async fn confirm_user_presence(&self) -> Result<bool, String> {
+        debug!("[mykey-auth] ConfirmUserPresence");
+        make_proxy(&self.conn)
+            .await?
+            .confirm_user_presence(self.pid)
+            .await
+            .map_err(|e| format!("D-Bus ConfirmUserPresence failed: {e}"))
+    }
+
+    pub async fn seal_secret(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+        debug!("[mykey-auth] SealSecret ({} bytes)", data.len());
+        make_proxy(&self.conn)
+            .await?
+            .seal_secret(self.pid, data.to_vec())
+            .await
+            .map_err(|e| format!("D-Bus SealSecret failed: {e}"))
+    }
+
+    pub async fn unseal_secret(&self, blob: &[u8]) -> Result<Vec<u8>, String> {
+        debug!("[mykey-auth] UnsealSecret ({} bytes)", blob.len());
+        make_proxy(&self.conn)
+            .await?
+            .unseal_secret(self.pid, blob.to_vec())
+            .await
+            .map_err(|e| format!("D-Bus UnsealSecret failed: {e}"))
+    }
+
+    pub async fn enable_biometric_backend(
+        &self,
+        target_uid: u32,
+        backend: &str,
+    ) -> Result<(), String> {
+        debug!("[mykey-auth] EnableBiometricBackend (target_uid={target_uid}, backend={backend})");
+        make_proxy(&self.conn)
+            .await?
+            .enable_biometric_backend(self.pid, target_uid, backend.to_string())
+            .await
+            .map_err(|e| format!("D-Bus EnableBiometricBackend failed: {e}"))
+    }
+
+    pub async fn disable_biometric_backend(&self, target_uid: u32) -> Result<(), String> {
+        debug!("[mykey-auth] DisableBiometricBackend (target_uid={target_uid})");
+        make_proxy(&self.conn)
+            .await?
+            .disable_biometric_backend(self.pid, target_uid)
+            .await
+            .map_err(|e| format!("D-Bus DisableBiometricBackend failed: {e}"))
     }
 
     pub async fn pin_verify(&self, target_uid: u32, pin: &[u8]) -> Result<bool, String> {

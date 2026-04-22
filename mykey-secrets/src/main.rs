@@ -6,39 +6,46 @@
 mod collection;
 mod daemon_client;
 mod item;
+mod paths;
 mod prereqs;
 mod service;
 mod session;
 mod storage;
 
-use std::collections::HashMap;
 use std::process;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
 use log::{error, info, warn};
 use zbus::zvariant::OwnedObjectPath;
 use zbus::ConnectionBuilder;
 use collection::CollectionInterface;
 use item::ItemInterface;
 
+fn setup_logger() {
+    let Some(log_path) = std::env::var_os("MYKEY_SECRETS_LOG") else {
+        return;
+    };
+
+    let Ok(log_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    else {
+        return;
+    };
+
+    let mut builder = env_logger::Builder::new();
+    builder
+        .target(env_logger::Target::Pipe(Box::new(log_file)))
+        .filter_level(log::LevelFilter::Info)
+        .format_timestamp_secs();
+    let _ = builder.try_init();
+}
+
 #[tokio::main]
 async fn main() {
-    // Initialise file logger
-    let log_path = "/tmp/mykey-secrets.log";
-    let target = Box::new(
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .unwrap_or_else(|e| {
-                eprintln!("Cannot open log file {log_path}: {e}");
-                process::exit(1);
-            }),
-    );
-    env_logger::Builder::new()
-        .target(env_logger::Target::Pipe(target))
-        .filter_level(log::LevelFilter::Debug)
-        .init();
+    setup_logger();
 
     info!("mykey-secrets starting");
 
@@ -73,18 +80,6 @@ async fn main() {
         stored_cols.push(default_meta);
     }
 
-    // Build the object path list for the Collections property on the Service.
-    let col_paths: Vec<OwnedObjectPath> = stored_cols
-        .iter()
-        .filter_map(|c| {
-            OwnedObjectPath::try_from(format!(
-                "/org/freedesktop/secrets/collection/{}",
-                c.id
-            ))
-            .ok()
-        })
-        .collect();
-
     // Load persisted alias mappings and convert to OwnedObjectPath values.
     let raw_aliases = storage::load_aliases();
     let mut aliases: HashMap<String, OwnedObjectPath> = raw_aliases
@@ -111,6 +106,13 @@ async fn main() {
             OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/default").unwrap()
         });
         aliases.insert("default".to_string(), default_alias);
+        let raw: HashMap<String, String> = aliases
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().to_owned()))
+            .collect();
+        if let Err(e) = storage::save_aliases(&raw) {
+            warn!("Could not persist default alias: {e}");
+        }
     }
 
     let default_alias = aliases.get("default").cloned()
@@ -124,7 +126,7 @@ async fn main() {
         default_alias.as_str()
     );
 
-    let svc = service::ServiceInterface::new(col_paths, aliases, Arc::clone(&conn_cell));
+    let svc = service::ServiceInterface::new(Arc::clone(&conn_cell));
 
     // Build the D-Bus connection.  Only the top-level ServiceInterface is
     // registered here; all collections and items are registered below after
@@ -165,14 +167,6 @@ async fn main() {
         );
 
         let stored_items = storage::load_items(&col_meta.id);
-        let item_paths: Vec<OwnedObjectPath> = stored_items
-            .iter()
-            .filter_map(|i| {
-                let safe_id = i.id.replace('-', "_");
-                OwnedObjectPath::try_from(format!("{}/{}", col_path_str, safe_id)).ok()
-            })
-            .collect();
-
         info!(
             "[main] Registering collection '{}' with {} item(s) at {}",
             col_meta.id,
@@ -182,10 +176,6 @@ async fn main() {
 
         let col_iface = CollectionInterface {
             id: col_meta.id.clone(),
-            label: col_meta.label.clone(),
-            created: col_meta.created,
-            modified: col_meta.modified,
-            item_paths,
             conn: Arc::clone(&conn_cell),
         };
 

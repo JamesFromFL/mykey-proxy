@@ -1,64 +1,101 @@
-// tray.rs — ksni::Tray implementation for MyKey.
+use crate::status::StatusSnapshot;
+use ksni::{menu, Icon, Status, Tray};
 
-use ksni::{menu, Icon, Tray};
+static LOGO_BYTES: &[u8] = include_bytes!("../../assets/mykey-logo.png");
 
-static LOGO_BYTES: &[u8] =
-    include_bytes!("../../assets/mykey-logo.png");
-
-pub struct WebAuthnTray {
+pub struct MyKeyTray {
     icons: Vec<Icon>,
+    snapshot: StatusSnapshot,
 }
 
-impl WebAuthnTray {
-    pub fn new() -> Self {
-        WebAuthnTray {
+impl MyKeyTray {
+    pub fn new(snapshot: StatusSnapshot) -> Self {
+        Self {
             icons: load_icons(),
+            snapshot,
         }
+    }
+
+    pub fn set_snapshot(&mut self, snapshot: StatusSnapshot) {
+        self.snapshot = snapshot;
+    }
+
+    pub fn refresh_status_cache(&mut self) {
+        self.snapshot = StatusSnapshot::gather();
     }
 }
 
-impl Tray for WebAuthnTray {
+impl Tray for MyKeyTray {
     fn id(&self) -> String {
         "mykey-tray".into()
     }
 
     fn title(&self) -> String {
-        "MyKey Proxy".into()
+        "MyKey".into()
+    }
+
+    fn status(&self) -> Status {
+        if self.snapshot.daemon_is_active() {
+            Status::Active
+        } else {
+            Status::NeedsAttention
+        }
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
         self.icons.clone()
     }
 
+    fn activate(&mut self, _x: i32, _y: i32) {
+        self.refresh_status_cache();
+    }
+
+    fn secondary_activate(&mut self, _x: i32, _y: i32) {
+        self.refresh_status_cache();
+    }
+
     fn menu(&self) -> Vec<menu::MenuItem<Self>> {
-        vec![
+        let mut items = vec![
             menu::StandardItem {
-                label:   "MyKey Proxy".into(),
+                label: "MyKey".into(),
                 enabled: false,
                 ..Default::default()
             }
             .into(),
             menu::MenuItem::Separator,
+        ];
+
+        items.extend(
+            self.snapshot
+                .lines()
+                .into_iter()
+                .map(|label| menu::StandardItem {
+                    label,
+                    enabled: false,
+                    ..Default::default()
+                })
+                .map(Into::into),
+        );
+
+        items.extend([
+            menu::MenuItem::Separator,
             menu::StandardItem {
-                label:   "Status: Running".into(),
-                enabled: false,
+                label: "Refresh Status".into(),
+                activate: Box::new(|tray: &mut Self| tray.refresh_status_cache()),
                 ..Default::default()
             }
             .into(),
-            menu::MenuItem::Separator,
             menu::StandardItem {
-                label:    "Quit".into(),
+                label: "Quit".into(),
                 activate: Box::new(|_| std::process::exit(0)),
                 ..Default::default()
             }
             .into(),
-        ]
+        ]);
+
+        items
     }
 }
-
-// ---------------------------------------------------------------------------
-// PNG → ksni ARGB32 icon conversion (sizes: 16, 22, 32, 48, 64, 128)
-// ---------------------------------------------------------------------------
 
 fn load_icons() -> Vec<Icon> {
     let img = match image::load_from_memory(LOGO_BYTES) {
@@ -79,7 +116,6 @@ fn encode_icon(img: &image::DynamicImage, size: u32) -> Icon {
     let resized = img.resize_exact(size, size, image::imageops::FilterType::Lanczos3);
     let rgba = resized.to_rgba8();
 
-    // ksni expects ARGB32 big-endian packed into Vec<u8>
     let data: Vec<u8> = rgba
         .pixels()
         .flat_map(|p| {
@@ -89,7 +125,7 @@ fn encode_icon(img: &image::DynamicImage, size: u32) -> Icon {
         .collect();
 
     Icon {
-        width:  size as i32,
+        width: size as i32,
         height: size as i32,
         data,
     }

@@ -22,13 +22,18 @@ use std::process::Command;
 pub async fn verify_user_presence(calling_pid: u32) -> Result<bool, String> {
     // ── Up to 3 attempts inside a blocking task ───────────────────────────
     tokio::task::spawn_blocking(move || {
-        info!("Starting polkit user-presence check for pid={}", calling_pid);
+        info!(
+            "Starting polkit user-presence check for pid={}",
+            calling_pid
+        );
 
         for attempt in 1u32..=3 {
             let output = Command::new("pkcheck")
                 .args([
-                    "--action-id", "com.mykey.authenticate",
-                    "--process", &calling_pid.to_string(),
+                    "--action-id",
+                    "com.mykey.authenticate",
+                    "--process",
+                    &calling_pid.to_string(),
                     "--allow-user-interaction",
                 ])
                 .output()
@@ -45,7 +50,10 @@ pub async fn verify_user_presence(calling_pid: u32) -> Result<bool, String> {
                 || stdout.contains("auth_self")
                 || stdout.contains("auth_admin")
             {
-                info!("Polkit user-presence check succeeded for pid={}", calling_pid);
+                info!(
+                    "Polkit user-presence check succeeded for pid={}",
+                    calling_pid
+                );
                 return Ok(true);
             }
 

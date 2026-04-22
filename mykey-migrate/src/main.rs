@@ -5,6 +5,7 @@
 //   --unenroll  Restore secrets from MyKey back to the previous provider.
 
 mod daemon_client;
+mod paths;
 mod secrets_client;
 mod storage;
 
@@ -440,7 +441,8 @@ You can restore it at any time by running: mykey-migrate --unenroll",
         Ok(stage) => stage,
         Err(e) => {
             fatal_with_support(&format!(
-                "{e}. Check that /etc/mykey/secrets/ is accessible."
+                "{e}. Check that {} is writable.",
+                storage::base_dir().display()
             ));
         }
     };
@@ -520,8 +522,11 @@ You can restore it at any time by running: mykey-migrate --unenroll",
     if let Err(e) = secrets_client::write_provider_info(&info) {
         eprintln!("⚠ Could not write provider info: {e}");
         if !pause_and_retry(
-            "Could not write provider info to /etc/mykey/provider/",
-            "sudo mkdir -p /etc/mykey/provider && sudo chown $USER:$USER /etc/mykey/provider",
+            &format!(
+                "Could not write provider info to {}",
+                paths::provider_dir().display()
+            ),
+            "mkdir -p \"${XDG_DATA_HOME:-$HOME/.local/share}/mykey/provider\"",
             || secrets_client::write_provider_info(&info).is_ok(),
             3,
         ) {
@@ -575,17 +580,7 @@ fn prompt_delete_keychain(keychain_path: &str) {
     match std::fs::remove_dir_all(keychain_path) {
         Ok(_) => {
             println!("✓ Old keychain deleted.");
-            // Update provider info
-            if let Ok(mut info) = secrets_client::read_provider_info() {
-                info.keychain_deleted = true;
-                // re-serialize and write back
-                if let Ok(json) = serde_json::to_string_pretty(&secrets_client::ProviderInfoFile {
-                    keychain_deleted: true,
-                    ..info
-                }) {
-                    let _ = std::fs::write("/etc/mykey/provider/info.json", json);
-                }
-            }
+            let _ = secrets_client::mark_keychain_deleted();
         }
         Err(e) => eprintln!("⚠ Could not delete keychain: {e}"),
     }
@@ -732,13 +727,10 @@ fn run_unenroll() {
             println!("Phrase did not match. Cancelled.");
             return;
         }
-        // Delete MyKey secrets (/etc/mykey/ is root-owned; use sudo).
+        // Delete MyKey secrets from the user's private data dir.
         println!();
         println!("Deleting MyKey secrets...");
-        std::process::Command::new("sudo")
-            .args(["rm", "-rf", "/etc/mykey/secrets"])
-            .status()
-            .ok();
+        let _ = storage::remove_all_storage();
         let _ = secrets_client::delete_provider_info();
         // Stop mykey-secrets
         let _ = std::process::Command::new("systemctl")
@@ -1068,34 +1060,38 @@ fn run_unenroll() {
     }
 
     // Step 14 — Clean up MyKey storage
-    // /etc/mykey/ is root-owned; use sudo for the removal.
     println!("Cleaning up MyKey storage...");
-    let rm_ok = std::process::Command::new("sudo")
-        .args(["rm", "-rf", "/etc/mykey/secrets"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !rm_ok {
+    if let Err(e) = storage::remove_all_storage() {
+        eprintln!("⚠ {e}");
         if !pause_and_retry(
-            "Could not remove /etc/mykey/secrets",
-            "sudo rm -rf /etc/mykey/secrets",
-            || !std::path::Path::new("/etc/mykey/secrets").exists(),
+            &format!("Could not remove {}", storage::base_dir().display()),
+            "rm -rf \"${XDG_DATA_HOME:-$HOME/.local/share}/mykey/secrets\"",
+            || !storage::base_dir().exists(),
             3,
         ) {
-            fatal_with_support("Could not remove /etc/mykey/secrets");
+            fatal_with_support(&format!(
+                "Could not remove {}",
+                storage::base_dir().display()
+            ));
         }
     }
-    println!("✓ /etc/mykey/secrets removed.");
+    println!("✓ {} removed.", storage::base_dir().display());
 
     if let Err(e) = secrets_client::delete_provider_info() {
         eprintln!("⚠ Could not remove provider info: {e}");
         if !pause_and_retry(
-            "Could not remove /etc/mykey/provider/info.json",
-            "sudo rm -f /etc/mykey/provider/info.json",
-            || !std::path::Path::new("/etc/mykey/provider/info.json").exists(),
+            &format!(
+                "Could not remove {}",
+                paths::provider_info_path().display()
+            ),
+            "rm -f \"${XDG_DATA_HOME:-$HOME/.local/share}/mykey/provider/info.json\"",
+            || !paths::provider_info_path().exists(),
             3,
         ) {
-            fatal_with_support("Could not remove /etc/mykey/provider/info.json");
+            fatal_with_support(&format!(
+                "Could not remove {}",
+                paths::provider_info_path().display()
+            ));
         }
     }
     println!("✓ Provider info removed.");

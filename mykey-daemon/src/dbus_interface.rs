@@ -1,4 +1,4 @@
-// dbus_interface.rs — zbus D-Bus interface for the MyKey Proxy daemon.
+// dbus_interface.rs — zbus D-Bus interface for the MyKey daemon.
 //
 // Interface name:  com.mykey.Daemon
 // Object path:     /com/mykey/Daemon
@@ -14,15 +14,17 @@
 // Callers supply their own PID, but the daemon cross-checks it against the
 // D-Bus sender's Unix credentials before accepting the request.
 
-use std::sync::Arc;
 use log::{debug, info, warn};
 use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
+use std::sync::Arc;
 use zbus::{message::Header, Connection};
+use zeroize::Zeroizing;
 
 use crate::authentication;
 use crate::crypto;
-use crate::local_auth_policy::{LocalAuthMethod, LocalAuthPolicyStore};
+use crate::local_auth_policy::{
+    BiometricBackend, LocalAuthMethod, LocalAuthPolicy, LocalAuthPolicyStore,
+};
 use crate::pam;
 use crate::pin_store::PinStore;
 use crate::protocol::{CreateRequest, GetRequest};
@@ -38,18 +40,18 @@ use crate::validator;
 
 /// State shared by the D-Bus interface across all D-Bus method calls.
 pub struct DaemonState {
-    pub sessions:     SessionStore,
+    pub sessions: SessionStore,
     pub replay_cache: AsyncReplayCache,
-    pub pin_store:    PinStore,
+    pub pin_store: PinStore,
     pub local_auth_policy_store: LocalAuthPolicyStore,
 }
 
 impl DaemonState {
     pub fn new() -> Self {
         DaemonState {
-            sessions:     SessionStore::new(),
+            sessions: SessionStore::new(),
             replay_cache: AsyncReplayCache::new(),
-            pin_store:    PinStore::default(),
+            pin_store: PinStore::default(),
             local_auth_policy_store: LocalAuthPolicyStore::default(),
         }
     }
@@ -242,21 +244,27 @@ impl DaemonInterface {
         #[zbus(connection)] conn: &Connection,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<Vec<u8>, zbus::fdo::Error> {
-        info!("[dbus] SealSecret called from pid={pid} ({} bytes)", data.len());
+        info!(
+            "[dbus] SealSecret called from pid={pid} ({} bytes)",
+            data.len()
+        );
 
         self.authorize_call(conn, &header, pid).await?;
 
         if self.state.sessions.with_token(pid, |_| ()).await.is_none() {
             warn!("[dbus] SealSecret rejected: no session for pid={pid}");
-            return Err(zbus::fdo::Error::AccessDenied(
-                format!("No session for pid={pid} — call Connect first"),
-            ));
+            return Err(zbus::fdo::Error::AccessDenied(format!(
+                "No session for pid={pid} — call Connect first"
+            )));
         }
 
         let blob = tpm::seal_blob(&data)
             .map_err(|e| zbus::fdo::Error::Failed(format!("SealSecret failed: {e}")))?;
 
-        info!("[dbus] SealSecret complete for pid={pid} (blob {} bytes)", blob.len());
+        info!(
+            "[dbus] SealSecret complete for pid={pid} (blob {} bytes)",
+            blob.len()
+        );
         Ok(blob)
     }
 
@@ -273,21 +281,27 @@ impl DaemonInterface {
         #[zbus(connection)] conn: &Connection,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<Vec<u8>, zbus::fdo::Error> {
-        info!("[dbus] UnsealSecret called from pid={pid} ({} bytes)", blob.len());
+        info!(
+            "[dbus] UnsealSecret called from pid={pid} ({} bytes)",
+            blob.len()
+        );
 
         self.authorize_call(conn, &header, pid).await?;
 
         if self.state.sessions.with_token(pid, |_| ()).await.is_none() {
             warn!("[dbus] UnsealSecret rejected: no session for pid={pid}");
-            return Err(zbus::fdo::Error::AccessDenied(
-                format!("No session for pid={pid} — call Connect first"),
-            ));
+            return Err(zbus::fdo::Error::AccessDenied(format!(
+                "No session for pid={pid} — call Connect first"
+            )));
         }
 
         let plaintext = tpm::unseal_blob(&blob)
             .map_err(|e| zbus::fdo::Error::Failed(format!("UnsealSecret failed: {e}")))?;
 
-        info!("[dbus] UnsealSecret complete for pid={pid} ({} bytes)", plaintext.len());
+        info!(
+            "[dbus] UnsealSecret complete for pid={pid} ({} bytes)",
+            plaintext.len()
+        );
         Ok(plaintext.to_vec())
     }
 
@@ -341,6 +355,43 @@ impl DaemonInterface {
             .authorize_pin_call(conn, &header, pid, target_uid)
             .await?;
         self.local_auth_status_for_uid(target_uid)
+    }
+
+    // ── EnableBiometricBackend ───────────────────────────────────────────────
+    /// Enable biometric-first local auth for `target_uid` with `backend`.
+    ///
+    /// This keeps MyKey PIN fallback enabled and enforces that a MyKey PIN is
+    /// already configured before biometric policy can be written.
+    async fn enable_biometric_backend(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        backend: String,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_pin_call(conn, &header, pid, target_uid)
+            .await?;
+        self.enable_biometric_backend_for_uid(target_uid, backend.as_str())
+    }
+
+    // ── DisableBiometricBackend ──────────────────────────────────────────────
+    /// Remove biometric-first local auth for `target_uid`.
+    ///
+    /// If a MyKey PIN is still configured, local auth falls back to PIN-only.
+    /// Otherwise the local-auth policy is cleared.
+    async fn disable_biometric_backend(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_pin_call(conn, &header, pid, target_uid)
+            .await?;
+        self.disable_biometric_backend_for_uid(target_uid)
     }
 
     // ── PinEnroll ────────────────────────────────────────────────────────────
@@ -430,9 +481,9 @@ impl DaemonInterface {
         let _identity = self
             .authorize_pin_management_call(conn, &header, pid)
             .await?;
-        pam::verify_user_presence(pid)
-            .await
-            .map_err(|e| zbus::fdo::Error::Failed(format!("User presence verification failed: {e}")))
+        pam::verify_user_presence(pid).await.map_err(|e| {
+            zbus::fdo::Error::Failed(format!("User presence verification failed: {e}"))
+        })
     }
 }
 
@@ -496,10 +547,7 @@ impl DaemonInterface {
             )));
         }
 
-        Ok(CallerIdentity {
-            uid,
-            mykey_program,
-        })
+        Ok(CallerIdentity { uid, mykey_program })
     }
 
     async fn ensure_session(&self, pid: u32) -> Result<(), zbus::fdo::Error> {
@@ -653,7 +701,9 @@ impl DaemonInterface {
         self.state
             .local_auth_policy_store
             .enable_pin_only(uid)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("Local auth policy update failed: {e}")))?;
+            .map_err(|e| {
+                zbus::fdo::Error::Failed(format!("Local auth policy update failed: {e}"))
+            })?;
         Ok(())
     }
 
@@ -673,7 +723,9 @@ impl DaemonInterface {
             .pin_store
             .read_pin_blob(uid)
             .map_err(|e| zbus::fdo::Error::Failed(format!("PIN read failed: {e}")))?
-            .ok_or_else(|| zbus::fdo::Error::Failed(format!("No MyKey PIN is set for uid={uid}")))?;
+            .ok_or_else(|| {
+                zbus::fdo::Error::Failed(format!("No MyKey PIN is set for uid={uid}"))
+            })?;
         let stored_hash = tpm::unseal_blob(&sealed)
             .map_err(|e| zbus::fdo::Error::Failed(format!("PIN unseal failed: {e}")))?;
         let pin = Zeroizing::new(pin);
@@ -740,7 +792,9 @@ impl DaemonInterface {
         self.state
             .local_auth_policy_store
             .on_pin_reset(uid)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("Local auth policy update failed: {e}")))?;
+            .map_err(|e| {
+                zbus::fdo::Error::Failed(format!("Local auth policy update failed: {e}"))
+            })?;
         Ok(())
     }
 
@@ -771,9 +825,7 @@ impl DaemonInterface {
                 .local_auth_policy_store
                 .enable_pin_only(uid)
                 .map_err(|e| {
-                    zbus::fdo::Error::Failed(format!(
-                        "Local auth policy backfill failed: {e}"
-                    ))
+                    zbus::fdo::Error::Failed(format!("Local auth policy backfill failed: {e}"))
                 })?;
             policy = self
                 .state
@@ -796,6 +848,68 @@ impl DaemonInterface {
             policy.pin_fallback_enabled,
             biometric_backend,
         ))
+    }
+
+    fn enable_biometric_backend_for_uid(
+        &self,
+        uid: u32,
+        backend: &str,
+    ) -> Result<(), zbus::fdo::Error> {
+        if !self
+            .state
+            .pin_store
+            .pin_is_set(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN status failed: {e}")))?
+        {
+            return Err(zbus::fdo::Error::Failed(format!(
+                "A MyKey PIN must be configured before biometrics can be enabled for uid={uid}"
+            )));
+        }
+
+        let biometric_backend = match backend {
+            "fprintd" => BiometricBackend::Fprintd,
+            "howdy" => BiometricBackend::Howdy,
+            other => {
+                return Err(zbus::fdo::Error::InvalidArgs(format!(
+                    "Unsupported biometric backend: {other}"
+                )))
+            }
+        };
+
+        let policy = LocalAuthPolicy {
+            enabled: true,
+            primary_method: LocalAuthMethod::Biometric,
+            pin_fallback_enabled: true,
+            biometric_backend: Some(biometric_backend),
+        };
+        self.state
+            .local_auth_policy_store
+            .write_policy(uid, &policy)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Local auth policy update failed: {e}")))
+    }
+
+    fn disable_biometric_backend_for_uid(&self, uid: u32) -> Result<(), zbus::fdo::Error> {
+        if self
+            .state
+            .pin_store
+            .pin_is_set(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN status failed: {e}")))?
+        {
+            self.state
+                .local_auth_policy_store
+                .enable_pin_only(uid)
+                .map_err(|e| {
+                    zbus::fdo::Error::Failed(format!("Local auth policy update failed: {e}"))
+                })?;
+        } else {
+            self.state
+                .local_auth_policy_store
+                .clear_policy(uid)
+                .map_err(|e| {
+                    zbus::fdo::Error::Failed(format!("Local auth policy clear failed: {e}"))
+                })?;
+        }
+        Ok(())
     }
 
     /// Decrypt `ciphertext` (JSON-serialised EncryptedPayload) using the

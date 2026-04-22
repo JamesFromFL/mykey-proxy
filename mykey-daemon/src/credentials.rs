@@ -5,8 +5,8 @@
 //
 // No key material is stored here; private keys live in tpm.rs.
 
-use std::path::{Path, PathBuf};
 use log::debug;
+use std::path::{Path, PathBuf};
 
 use crate::protocol::{AllowCredential, CredentialMeta, GetRequest};
 
@@ -25,8 +25,12 @@ pub fn write_credential_metadata(meta: &CredentialMeta) -> Result<(), String> {
     let json = serde_json::to_vec_pretty(meta)
         .map_err(|e| format!("Cannot serialise credential metadata: {e}"))?;
 
-    std::fs::write(&path, &json)
-        .map_err(|e| format!("Cannot write credential metadata to {}: {e}", path.display()))?;
+    std::fs::write(&path, &json).map_err(|e| {
+        format!(
+            "Cannot write credential metadata to {}: {e}",
+            path.display()
+        )
+    })?;
 
     debug!("Wrote credential metadata to {}", path.display());
     Ok(())

@@ -305,7 +305,9 @@ mod tests {
         let store = root.store();
 
         store.enable_pin_only(1000).expect("enable pin-only policy");
-        store.on_pin_reset(1000).expect("update policy on pin reset");
+        store
+            .on_pin_reset(1000)
+            .expect("update policy on pin reset");
         let policy = store.read_policy(1000).expect("read updated policy");
 
         assert!(!policy.enabled);
@@ -330,7 +332,9 @@ mod tests {
             )
             .expect("write biometric policy");
 
-        store.on_pin_reset(1000).expect("update policy on pin reset");
+        store
+            .on_pin_reset(1000)
+            .expect("update policy on pin reset");
         let policy = store.read_policy(1000).expect("read updated policy");
 
         assert_eq!(policy, LocalAuthPolicy::default());

@@ -11,8 +11,8 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Key, Nonce,
 };
-use hmac::{Hmac, Mac};
 use hmac::digest::KeyInit as HmacKeyInit;
+use hmac::{Hmac, Mac};
 use log::{debug, warn};
 use rand::RngCore;
 use sha2::Sha256;
@@ -51,15 +51,25 @@ pub fn encrypt_payload(key: &[u8; 32], plaintext: &[u8]) -> Result<EncryptedPayl
         .encrypt(nonce, plaintext)
         .map_err(|_| "[crypto] AES-256-GCM encryption failed".to_string())?;
 
-    debug!("[crypto] Encrypted {} bytes → {} bytes ciphertext", plaintext.len(), ciphertext.len());
-    Ok(EncryptedPayload { nonce: nonce_bytes, ciphertext })
+    debug!(
+        "[crypto] Encrypted {} bytes → {} bytes ciphertext",
+        plaintext.len(),
+        ciphertext.len()
+    );
+    Ok(EncryptedPayload {
+        nonce: nonce_bytes,
+        ciphertext,
+    })
 }
 
 /// Decrypt an `EncryptedPayload` with AES-256-GCM using `key` (32 bytes).
 ///
 /// Fails if the authentication tag does not match (ciphertext was tampered
 /// with or the wrong key was used).
-pub fn decrypt_payload(key: &[u8; 32], payload: EncryptedPayload) -> Result<Zeroizing<Vec<u8>>, String> {
+pub fn decrypt_payload(
+    key: &[u8; 32],
+    payload: EncryptedPayload,
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let nonce = Nonce::from_slice(&payload.nonce);
 
@@ -70,7 +80,11 @@ pub fn decrypt_payload(key: &[u8; 32], payload: EncryptedPayload) -> Result<Zero
             "[crypto] Decryption failed: authentication tag mismatch".to_string()
         })?;
 
-    debug!("[crypto] Decrypted {} bytes ciphertext → {} bytes plaintext", payload.ciphertext.len(), plaintext.len());
+    debug!(
+        "[crypto] Decrypted {} bytes ciphertext → {} bytes plaintext",
+        payload.ciphertext.len(),
+        plaintext.len()
+    );
     Ok(Zeroizing::new(plaintext))
 }
 
@@ -108,10 +122,7 @@ pub fn verify_hmac(key: &[u8], data: &[u8], expected: &[u8]) -> bool {
 
 /// Wrap a 32-byte session token in an AES-GCM envelope keyed by the bootstrap
 /// secret.  Returns the envelope as a JSON string (base64url nonce + ciphertext).
-pub fn wrap_session_token(
-    bootstrap_key: &[u8; 32],
-    token: &[u8; 32],
-) -> Result<String, String> {
+pub fn wrap_session_token(bootstrap_key: &[u8; 32], token: &[u8; 32]) -> Result<String, String> {
     let envelope = encrypt_payload(bootstrap_key, token)?;
     serde_json::to_string(&envelope)
         .map_err(|e| format!("[crypto] Failed to serialise session token envelope: {e}"))
