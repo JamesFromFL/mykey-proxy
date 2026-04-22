@@ -1,12 +1,13 @@
-# MyKey TO-DO
+# MyKey Project Status
 
-Last updated: 2026-04-21
+Last updated: 2026-04-22
 
 ## Purpose
-- Canonical running to-do list for MyKey release hardening.
+- Canonical running project status and to-do document for MyKey release hardening.
 - Track work in execution order first, then by module and severity.
 - Keep this file updated before and after each patch set.
 - Current rule for `mykey-pin`: do not stop for a commit until it reaches a usable state.
+- Keep the chronological project timeline in the `Project History` section at the bottom.
 
 ## Current Status
 - `mykey-migrate`
@@ -154,7 +155,7 @@ Last updated: 2026-04-21
    - elevated MyKey actions must always require password and use a separate rate-limited path from everyday local auth
 
 18. [ ] `Important` `mykey-biometrics` Add a dedicated biometric setup and management helper on top of existing system stacks.
-   - add `mykey-biometrics` with commands such as `setup`, `status`, `test`, `reset`, and later `disable`
+   - first scaffold now exists through `mykey-auth biometrics` with `enroll`, `unenroll`, `status`, and `exit`
    - support backend selection for `fprintd` and `Howdy`
    - detect whether the selected backend is installed and offer install guidance or install integration where appropriate
    - drive backend enrollment, backend validation, MyKey policy enablement, and final verification
@@ -219,12 +220,12 @@ Last updated: 2026-04-21
    - D-Bus policy files
    - polkit policy files
 
-26. [ ] `Important` `docs` Rewrite `ARCHITECTURE.md` around the current MyKey platform instead of the old MyKey Proxy layout.
+26. [x] `Important` `docs` Overhaul `docs/architecture.md` around the current MyKey platform instead of the old MyKey Proxy layout.
    - stop describing the project as only a WebAuthn proxy
    - reflect the current `mykey-auth/` subtree, daemon-owned local auth policy, and current component boundaries
    - keep it as the technical system-layout document for reviewers and advanced users
 
-27. [ ] `Important` `docs` Rewrite `THREAT_MODEL.md` around the current MyKey platform and enforced policy.
+27. [x] `Important` `docs` Overhaul `docs/threat-model.md` around the current MyKey platform and enforced policy.
    - stop describing only the old proxy threat model
    - reflect daemon-owned PIN policy, `pam_mykey`, local auth orchestration, and current prerequisite enforcement
    - keep it as the trust-boundary and attacker-model document for technical reviewers
@@ -312,7 +313,7 @@ Last updated: 2026-04-21
 - [x] Enforce caller-to-user binding for PIN methods.
 
 #### Important
-- [ ] Move PIN verification, change, reset, and lockout updates fully behind daemon methods.
+- [x] Move PIN verification, change, reset, and lockout updates fully behind daemon methods.
 - [x] Revisit daemon-side brute-force behavior so non-PIN password flows are not over-hardened.
   - daemon-side polkit/password verification no longer carries a MyKey-managed cooldown
 - [x] Keep the current PIN lockout schedule at 3 free attempts, then 1m → 5m → 15m → 30m → 1h → 2h → 5h.
@@ -384,7 +385,7 @@ Last updated: 2026-04-21
 - [x] Add the first `mykey-auth biometrics` setup/status/unenroll scaffold.
   - interactive `enroll`, `unenroll`, `status`, and `exit` flow now lives under `mykey-auth biometrics`
   - the flow keeps TPM-sealed biometric tracking metadata under `/etc/mykey/auth/<uid>/`
-  - tracked names are MyKey-local biometric people only and do not create Linux accounts
+  - the current Linux account name is the single tracked identity in the sealed registry; no new Linux accounts are created
 - [x] Support first biometric backend selection for `fprintd` and `Howdy`.
   - the current scaffold can enroll through `fprintd` and `Howdy`, detect hardware best-effort, and prompt for package install when practical
   - MyKey currently tracks only one active biometric backend in daemon policy at a time even if multiple providers are enrolled
@@ -445,8 +446,8 @@ Last updated: 2026-04-21
 ### `docs`
 
 #### Important
-- [ ] Rewrite `ARCHITECTURE.md` around the current MyKey platform.
-- [ ] Rewrite `THREAT_MODEL.md` around the current MyKey platform.
+- [x] Overhaul `docs/architecture.md` around the current MyKey platform.
+- [x] Overhaul `docs/threat-model.md` around the current MyKey platform.
 
 ### `validation`
 
@@ -500,7 +501,179 @@ Last updated: 2026-04-21
 ### Important
 - [ ] Revisit `mykey-daemon` password-side brute-force behavior after Level 1 `mykey-pin` is usable.
 - [ ] Review remaining modules one at a time before first release.
-- [ ] Keep `ARCHITECTURE.md` and `THREAT_MODEL.md` updated as the platform design changes instead of letting them drift behind the code again.
+- [ ] Keep `docs/architecture.md` and `docs/threat-model.md` updated as the platform design changes instead of letting them drift behind the code again.
 
 ### Low
 - [ ] Keep GUI/package integration notes separate from backend correctness work until backend paths are stable.
+
+---
+
+## Project History
+
+Reconstructed from commit history in chronological order.
+Grouped by day, oldest first.
+
+### 2026-04-04
+- Scaffolded the repo, initial docs, assets, and the base project structure.
+- Added the Chromium MV3 extension scaffold with `webAuthenticationProxy`, crypto helpers, and storage helpers.
+- Added the first Rust native-messaging host with PAM auth, P-256 crypto, TPM stubs, and request handlers.
+- Added the persistent daemon with D-Bus transport, session tokens, AES-GCM IPC encryption, HMAC validation, replay protection, caller ancestry checks, prerequisite enforcement, and systemd hardening.
+- Bridged the native host to the daemon over D-Bus with encrypted request transport and HMAC on all messages.
+- Rewrote the README with roadmap, requirements, disclaimer, and a plain-English project overview.
+- Rewrote the threat model around the early proxy-era design and its planned mitigations.
+- Rewrote the architecture document with the initial implementation, request flows, and trust model.
+- Corrected author attribution to JamesFromFL.
+- Added the first system tray indicator with KStatusNotifierItem compatibility.
+- Wired daemon `Register` and `Authenticate` end to end with PAM gating, P-256 key generation, TPM sealing, authenticator data construction, and assertion signing.
+- Fixed installer Cargo detection when run under `sudo`.
+- Improved installer cargo discovery and tray user-service installation ownership.
+- Switched the daemon path to the system D-Bus and ensured the installer builds as the real user instead of root.
+- Added the D-Bus system policy file and installed it from the installer.
+- Polished install and uninstall wiring around D-Bus, the system bus, and user-owned tray service setup.
+
+### 2026-04-05
+- Added the first guided installer with Secure Boot setup, TPM checks, per-file EFI signing, extension setup, and a full health check.
+- Updated the README to match the installer flow, stylized logo, and then-current project status.
+- Fixed the native host to use the system bus instead of the session bus.
+- Removed the bootstrap key from daemon session setup and returned the session token directly over the kernel-verified system bus.
+- Removed bootstrap-key decryption from the native host to match the new daemon session model.
+- Removed bootstrap-key generation and related health checks from the installer.
+- Updated architecture and threat-model docs to reflect bootstrap-key removal and the system-bus session model.
+- Fixed extension startup to call `attach()` and corrected error handling to use the proper completion APIs.
+- Fixed protocol parsing to accept numeric or string `requestId` values and corrected `clientDataJSON` field casing.
+- Cleared the replay cache on new daemon sessions and passed the calling PID through auth handlers.
+- Replaced broken `/dev/tty` PAM prompting in the daemon with `polkit pkcheck` so desktop auth agents can handle user presence.
+- Improved extension startup/error handling again, increased timeout to 30 seconds, and returned the extra WebAuthn fields Chrome expected.
+- Added polkit policy, a sudoers rule for `pkcheck`, TPM group handling, and write exceptions for credential storage in the hardened service unit.
+- Fixed `rpIdHash` computation to hash the full Chrome extension origin in the proxy design.
+
+### 2026-04-06
+- Added real TPM2 key sealing with PCR 0+7 policy binding through `tss-esapi`.
+- Improved installer Secure Boot guidance by adding a Microsoft keys prompt, opening `chrome://extensions`, and correcting the polkit owner annotation.
+- Added daemon-side polkit retry logic with escalating cooldowns to slow password guessing.
+- Updated README, architecture, and threat-model docs to reflect real TPM sealing, polkit auth, brute-force protection, and the planned manager.
+- Removed the NordPass compatibility mention from the docs.
+- Simplified the README roadmap and status presentation.
+- Updated docs again to remove MOK scope, correct bootstrap-key references, add brute-force notes, and expand Firefox/manager planning.
+- Fixed daemon `rpIdHash` handling for extension IDs versus normal web relying parties.
+- Fixed the extension to extract `userId` and `userName` correctly so `userHandle` storage and return behavior were accurate.
+- Hard-enforced Secure Boot in the daemon at startup instead of treating it as advisory.
+- Marked hard Secure Boot enforcement as complete in the README.
+- Renamed the project from WebAuthn Proxy to MyKey Proxy across binaries, D-Bus names, config paths, scripts, and docs.
+- Cleaned up remaining `webauthn-proxy` references missed during the rename.
+- Fixed the renamed tray service filename and removed an invalid `ProtectMemory` unit directive.
+- Prevented installer runs as root, fixed tray installation for non-root users, ensured extension setup always runs, and corrected binary-signing logic.
+- Removed invalid ELF binary signing and corrected tray installation to run in the real user context.
+
+### 2026-04-07
+- Added the initial GTK4 manager application scaffold.
+
+### 2026-04-08
+- Expanded the README with more project detail and testing notes.
+- Revised and strengthened the threat-model document.
+- Revised the architecture document again for the MyKey Proxy design.
+- Added Discord release notifications.
+- Added Discord dev-log notifications.
+
+### 2026-04-09
+- Renamed the project from MyKey Proxy to MyKey and broadened the project framing.
+- Replaced the old assets with the new MyKey branding set.
+- Added size-variant logos.
+- Updated the README logo image.
+- Improved README logo presentation.
+- Changed the repository URL from `mykey-proxy` to `mykey`.
+- Renamed `daemon/` to `mykey-daemon/` and updated D-Bus names and config paths to the final `com.mykey.*` and `/etc/mykey/` forms.
+- Renamed `native-host/` to `mykey-host/` and updated its D-Bus names and references.
+- Renamed the Chromium extension tree to `mykey-proxy/chromium/`, added the Firefox placeholder, regenerated icons, and renamed the native-messaging host manifest.
+- Renamed `systray/` to `mykey-tray/` and updated icon generation and references.
+- Renamed `manager/` to `mykey-manager/` and updated application IDs and window titles.
+- Renamed scripts/config files and updated all remaining `mykey-proxy` references across the repo.
+- Updated `CLAUDE.md` to reflect the expanded MyKey scope, component names, and crate layout.
+- Updated the Discord workflow branding from MyKey Proxy to MyKey.
+- Added `SealSecret` and `UnsealSecret` daemon methods to support the TPM-backed secrets path.
+- Added the initial `mykey-secrets` crate with Secret Service skeleton APIs, session management, storage layout, and a daemon TPM client.
+- Added the `mykey-secrets` user service, session-bus policy file, and installer wiring.
+- Implemented `CreateItem`, `SearchItems`, and `GetSecrets` with real TPM-sealed storage in `mykey-secrets`.
+- Fixed installer directory creation for `/etc/mykey/secrets/default/`.
+- Fixed stale installer references to the old daemon directory.
+- Corrected daemon binary install paths and hash labels in the installer.
+- Added Secure Boot and TPM prerequisite enforcement to `mykey-secrets` startup.
+- Fixed remaining installer path references, session D-Bus directory creation, health checks, and binary checks for `mykey-secrets`.
+- Removed invalid binary-integrity prerequisites from `mykey-secrets`, fixed service startup ordering, converted it to a user service, and added session D-Bus directory creation.
+
+### 2026-04-10
+- Added the standalone `mykey-migrate` tool for Secret Service migration from GNOME Keyring, KWallet, and KeePassXC into MyKey.
+- Updated the tray icon to use the new repo-root MyKey logo asset.
+- Added a dedicated daemon caller-validation path for first-party MyKey tools such as `mykey-secrets`, `mykey-migrate`, and `mykey-manager`.
+
+### 2026-04-11
+- Rewrote migration provider detection around D-Bus and systemd, added KeePassXC stop guidance, wrote provider info to `/etc/mykey/provider/info.json`, and added optional keychain deletion prompts.
+- Refactored `mykey-migrate` around explicit `--enroll` and `--unenroll` subcommands.
+- Updated README component and roadmap sections to match the migration/secrets work.
+- Fixed README markdown.
+- Fixed README component-name formatting.
+- Added the `--enroll` and `--unenroll` command flow, collection unlock before writes, provider info handling, and keychain deletion prompts.
+- Wired `mykey-migrate` into installer build, health checks, and uninstall flow and cleaned stale `mykey-secrets` logs before startup.
+- Fixed session-bus policy so the real user can own `org.freedesktop.secrets`, corrected `/etc/mykey` traversal permissions, removed the race from `--now`, and cleaned logs before service start.
+- Added detection and stopping of conflicting Secret Service providers in the installer and fixed related shell and permission issues.
+
+### 2026-04-13
+- Rewrote `mykey-migrate --enroll` and `--unenroll` into fuller self-contained flows with provider selection and simpler installer handoff.
+- Added envelope encryption for large secret sealing and made uninstall start with `mykey-migrate --unenroll`.
+- Added a patience notice to enroll output for slow TPM sealing.
+- Ensured `mykey-secrets` always starts at the end of enroll and removed an incorrect early exit from unenroll.
+- Fixed the full set of identified migration audit bugs around service startup, provider masking, fatal stop failures, unenroll menus, service name handling, systemd fallback detection, unlock behavior, and invalid user-service dependencies.
+
+### 2026-04-14
+- Aligned migration enroll and unenroll flows to the intended spec, including verified start/stop behavior, fatal cleanup, provider advisories, and correct keychain deletion order.
+- Carried the same migration fixes into the install/uninstall scripts and removed duplicated `mykey-secrets` operations.
+- Replaced the uninstall `pkexec` block with a `sudo -v` keepalive pattern.
+- Marked the migration tool complete in the README.
+- Registered all collections and items on `mykey-secrets` startup, added `Unlock`, `Lock`, `Collections`, and `ReadAlias`, fixed D-Bus object paths, and pointed the default alias to the migrated collection.
+- Fixed UUID handling across all remaining Secret Service paths and added collection search logging.
+- Replaced the blocking daemon client in `mykey-secrets` with an async client and fixed missing awaits.
+- Fixed remaining Secret Service compliance issues around duplicate alias objects, session cleanup, item deletion, collection modification timestamps, and `ItemCreated` signaling.
+
+### 2026-04-16
+- Implemented `Collection.Delete`, `CreateCollection`, change signals, alias persistence, and collection lifecycle signals in `mykey-secrets`.
+- Changed enroll to uninstall the previous provider before killing it, added XDG autostart for `mykey-secrets`, and continued Secret Service feature completion.
+- Fixed unenroll cleanup of `/etc/mykey/secrets`, corrected provider stop ordering, and refined autostart management.
+- Added a pause-and-retry recovery pattern across migration flows with explicit support links and user guidance.
+- Added the Firefox extension scaffold as a placeholder while Mozilla platform authenticator support remained unavailable.
+- Revised the project roadmap with updated status.
+- Revised the roadmap again for WebAuthn and Firefox planning.
+
+### 2026-04-17
+- Added the `mykey-pin` crate with a PAM module and CLI for TPM-backed PIN authentication aligned with daemon lockout behavior.
+- Wired `mykey-pin` into installer build, install, health check, and uninstall cleanup and created the initial `/etc/mykey/pin/` path.
+- Simplified unenroll collection handling back to a cleaner user-assisted unlock flow.
+
+### 2026-04-18
+- Rewrote the unenroll collection flow toward spec-correct Secret Service behavior.
+
+### 2026-04-19
+- Hardened Secret Service unenroll and restore behavior.
+- Hardened KWallet and KeePassXC readiness handling.
+- Hardened enroll transaction behavior and storage staging.
+
+### 2026-04-20
+- Redesigned PIN auth around a daemon-owned per-user PAM flow.
+- Rewrote the README project overview and roadmap again.
+- Removed `CLAUDE.md` from the repo.
+- Reorganized the local-auth stack under `mykey-auth/`.
+
+### 2026-04-22
+- Overhauled the platform around daemon-owned local auth and de-scoped the browser-bridge architecture.
+- Removed `mykey-proxy` from project scope and repo.
+- Removed `mykey-host` from project scope and repo.
+- Added `mykey-auth enable|disable|login|logout|status` with MyKey-managed PAM target handling.
+- Added the first `mykey-auth biometrics` scaffold with `fprintd` and `Howdy` setup, status, and TPM-sealed metadata tracking.
+- Fixed `mykey-secrets` runtime state handling, atomic writes, and user-path ownership model.
+- Reworked `mykey-tray` into an optional daemon-coupled tray with `run|enable|disable|status`.
+- Audited installer, services, D-Bus policy, and polkit policy as one release surface.
+- Added the first Arch packaging scaffold and transition notes.
+- Moved repo-backed documentation into `docs/` and retired the old top-level architecture and threat-model files.
+- Overhauled `docs/architecture.md` around the current runtime layers, service ownership, state layout, and setup model.
+- Overhauled `docs/threat-model.md` around the current daemon, PAM, secrets, migration, and packaging trust boundaries.
+- Refined the architecture and threat-model docs with quick-reference tables, lifecycle summaries, trust-boundary summaries, and explicit explanations for the supported security baseline.
+- Refined the README to use friendlier front-facing links for docs and project status and added a threat-model pointer under supported-system requirements.

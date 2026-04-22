@@ -30,6 +30,24 @@ At a high level, MyKey aims to give Linux users:
 
 ---
 
+## 📚 Want To Dig Deeper?
+
+If you want the more technical breakdown of how MyKey is designed, how the
+pieces fit together, and where the project is headed, start in
+[`docs/`](docs/README.md).
+
+---
+
+## 📈 Project Status
+
+MyKey is moving fast and changing often.
+
+For the most accurate picture of what is done, what is in progress, and what is
+coming next, check [`PROJECT_STATUS.md`](PROJECT_STATUS.md). That file is kept
+up to date alongside the work itself.
+
+---
+
 ## ✨ Why MyKey?
 
 Linux already has strong security building blocks. The problem is that they are often split across different tools, desktop environments, and workflows.
@@ -153,78 +171,8 @@ MyKey seals data against platform state. That only works reliably when the boot 
 
 If the platform configuration drifts too far from the expected model, sealed data may fail to unlock. That is not a bug in the security model. That is part of how the protection works.
 
----
-
-## 🚧 Current Project Status
-
-MyKey is in active development and moving toward its first release.
-
-The core platform is no longer just an idea. Several major pieces are already working together, including TPM-backed operations, Secret Service support, secret migration, and daemon-owned local authentication.
-
-### ✅ What is working now
-- TPM-backed daemon architecture
-- Secret Service provider support through `mykey-secrets`
-- bidirectional secret migration with `mykey-migrate`
-- Secure Boot and platform prerequisite validation in the installer
-- per-user MyKey PIN foundation with daemon-backed verification
-- PAM-backed MyKey PIN authentication flow
-- strong-auth gating for PIN setup and reset
-
-### 🛠️ What is being finished now
-These are the main items still being refined before MyKey feels ready for a first public release:
-
-- final `mykey-pin` policy and user experience
-- biometric-first local authentication with PIN fallback
-- re-scoping passkey work around a native cross-platform authenticator path
-- cleanup of remaining brute-force behavior so it only affects MyKey PIN flows
-- packaging and release polish
-- clearer documentation for setup, fallback, and supported system requirements
-- continued work on `mykey-manager`
-
-### 📌 What this means today
-MyKey already has real working subsystems, but the project is still in the release-hardening phase.
-
-It is best described as:
-- functional in important areas
-- still evolving in policy and UX
-- not yet production-ready
-
----
-
-## 🗺️ Roadmap
-
-The roadmap is about where MyKey goes after the current release-hardening work is finished.
-
-### 📦 Near-term
-These are the first-release and shortly-after-release goals:
-
-- complete `mykey-manager`
-- finalize MyKey PIN policy and local auth behavior
-- add biometric-first local auth using supported Linux biometric frontends
-- improve packaging and installation experience
-- define the first cross-platform authenticator and passkey storage path
-- publish clearer user-facing documentation
-- prepare AUR packaging
-
-### 🔧 Mid-term
-These are the next meaningful platform improvements after the first release is stable:
-
-- expand recovery options for MyKey PIN
-- explore optional TOTP-based recovery flows
-- improve onboarding and management through the GUI
-- refine desktop integration and service management
-- research legitimate Linux platform-authenticator integration as a long-term browser patch path, not a release feature
-- continue hardening and validation across supported environments
-
-### 🚀 Long-term
-These are the bigger platform goals that move MyKey closer to a full Windows Hello–style Linux experience:
-
-- evolve MyKey PIN beyond the current sealed-verifier model toward a stronger TPM-backed local auth design
-- broaden supported authentication flows while keeping them local and hardware-aware
-- support device-bound cross-platform passkeys without turning MyKey into a syncing password manager
-- improve distribution options beyond source install
-- revisit Firefox support if browser platform support becomes practical
-- continue building toward a more complete Linux authentication platform, not just a collection of tools
+For a clearer explanation of why MyKey is opinionated about these requirements,
+see the [threat model](docs/threat-model.md).
 
 ---
 
