@@ -179,13 +179,13 @@ fn now_nanos() -> u128 {
 
 pub fn cooldown_secs(failed_sessions: u32) -> u64 {
     match failed_sessions {
-        0..=3 => 0,
-        4 => 60,
-        5 => 5 * 60,
-        6 => 15 * 60,
-        7 => 30 * 60,
-        8 => 60 * 60,
-        9 => 2 * 60 * 60,
+        0..=2 => 0,
+        3 => 60,
+        4 => 5 * 60,
+        5 => 15 * 60,
+        6 => 30 * 60,
+        7 => 60 * 60,
+        8 => 2 * 60 * 60,
         _ => 5 * 60 * 60,
     }
 }
@@ -300,17 +300,8 @@ mod tests {
         store
             .record_failed_attempt(1000)
             .expect("third failed attempt");
-        assert_eq!(
-            store
-                .lockout_remaining(1000)
-                .expect("lockout before threshold"),
-            None
-        );
-
-        let state = store
-            .record_failed_attempt(1000)
-            .expect("fourth failed attempt");
-        assert_eq!(state.failed_sessions, 4);
+        let state = store.read_attempts(1000).expect("attempt state at threshold");
+        assert_eq!(state.failed_sessions, 3);
         assert!(store
             .lockout_remaining(1000)
             .expect("lockout at threshold")
@@ -329,13 +320,13 @@ mod tests {
         assert_eq!(cooldown_secs(0), 0);
         assert_eq!(cooldown_secs(1), 0);
         assert_eq!(cooldown_secs(2), 0);
-        assert_eq!(cooldown_secs(3), 0);
-        assert_eq!(cooldown_secs(4), 60);
-        assert_eq!(cooldown_secs(5), 5 * 60);
-        assert_eq!(cooldown_secs(6), 15 * 60);
-        assert_eq!(cooldown_secs(7), 30 * 60);
-        assert_eq!(cooldown_secs(8), 60 * 60);
-        assert_eq!(cooldown_secs(9), 2 * 60 * 60);
+        assert_eq!(cooldown_secs(3), 60);
+        assert_eq!(cooldown_secs(4), 5 * 60);
+        assert_eq!(cooldown_secs(5), 15 * 60);
+        assert_eq!(cooldown_secs(6), 30 * 60);
+        assert_eq!(cooldown_secs(7), 60 * 60);
+        assert_eq!(cooldown_secs(8), 2 * 60 * 60);
+        assert_eq!(cooldown_secs(9), 5 * 60 * 60);
         assert_eq!(cooldown_secs(10), 5 * 60 * 60);
         assert_eq!(cooldown_secs(50), 5 * 60 * 60);
     }

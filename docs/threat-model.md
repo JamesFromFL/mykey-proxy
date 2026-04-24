@@ -431,8 +431,9 @@ Current mitigations:
 
 Residual risk:
 
-- biometric runtime auth now exists, but its host-installed behavior still
-  needs calibration across the supported PAM surfaces MyKey manages
+- biometric runtime auth now exists and is host-validated for `sudo`,
+  `polkit-1`, and the opt-in `gdm-fingerprint` target, but it still needs
+  broader calibration across the other supported PAM surfaces MyKey manages
 - security-key runtime auth now exists, but it still needs real hardware
   validation and broad host-installed calibration
 

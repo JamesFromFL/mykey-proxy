@@ -645,6 +645,13 @@ fn ensure_security_key_runtime_available() -> Result<(), String> {
 }
 
 fn require_elevated_password(target_uid: u32, purpose: &str, intro: &str) -> Result<(), String> {
+    match elevated_auth_precheck(target_uid) {
+        HelperAuthResult::Success => {}
+        HelperAuthResult::AuthFailed(message)
+        | HelperAuthResult::RateLimited(message)
+        | HelperAuthResult::Error(message) => return Err(message),
+    }
+
     println!("{intro}");
     let password = rpassword::prompt_password("Linux account password: ")
         .map(Zeroizing::new)
@@ -663,6 +670,48 @@ enum HelperAuthResult {
     AuthFailed(String),
     RateLimited(String),
     Error(String),
+}
+
+fn elevated_auth_precheck(uid: u32) -> HelperAuthResult {
+    let helper_path = match resolve_existing_path(ELEVATED_AUTH_HELPER_CANDIDATES) {
+        Some(path) => path,
+        None => {
+            return HelperAuthResult::Error(
+                "Could not find an installed mykey-elevated-auth helper.".to_string(),
+            );
+        }
+    };
+
+    let output = match Command::new(helper_path)
+        .args(["status", "--uid", &uid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            return HelperAuthResult::Error(format!("Could not launch mykey-elevated-auth: {e}"));
+        }
+    };
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match output.status.code() {
+        Some(0) => HelperAuthResult::Success,
+        Some(3) => HelperAuthResult::RateLimited(non_empty_message(
+            stderr,
+            "Elevated MyKey password auth is temporarily rate-limited.".to_string(),
+        )),
+        Some(2) => HelperAuthResult::Error(non_empty_message(
+            stderr,
+            "Elevated MyKey password verification failed.".to_string(),
+        )),
+        Some(code) => HelperAuthResult::Error(format!(
+            "mykey-elevated-auth exited unexpectedly with status {code}"
+        )),
+        None => HelperAuthResult::Error(
+            "mykey-elevated-auth terminated without an exit status".to_string(),
+        ),
+    }
 }
 
 fn run_elevated_auth_helper(uid: u32, purpose: &str, password: &[u8]) -> HelperAuthResult {

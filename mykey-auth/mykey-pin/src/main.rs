@@ -130,6 +130,9 @@ async fn run_reset() {
     }
     client.disconnect().await;
     println!("✓ MyKey PIN reset. Run mykey-pin set to create a new PIN.");
+    println!(
+        "Any biometric or security-key stages tied to the old PIN were disabled and must be reconfigured after you set a new PIN."
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +180,16 @@ async fn connect_client() -> daemon_client::DaemonClient {
 }
 
 fn require_elevated_password(uid: u32, purpose: &str, intro: &str) {
+    match elevated_auth_precheck(uid) {
+        HelperAuthResult::Success => {}
+        HelperAuthResult::AuthFailed(message)
+        | HelperAuthResult::RateLimited(message)
+        | HelperAuthResult::Error(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    }
+
     println!("{intro}");
     let password = match prompt_linux_password("Linux account password: ") {
         Some(password) => password,
@@ -287,7 +300,14 @@ async fn set_existing_pin(client: &daemon_client::DaemonClient, uid: u32) {
     {
         Ok(true) => {}
         Ok(false) => {
-            eprintln!("Current PIN verification failed.");
+            match client.pin_status(uid).await {
+                Ok(status) if status.cooldown_remaining_secs > 0 => eprintln!(
+                    "Current PIN verification failed.\nMyKey PIN locked. Try again in {} seconds.",
+                    status.cooldown_remaining_secs
+                ),
+                Ok(_) => eprintln!("Current PIN verification failed."),
+                Err(e) => eprintln!("Current PIN verification failed ({e})."),
+            }
             std::process::exit(1);
         }
         Err(e) => {
@@ -313,6 +333,48 @@ enum HelperAuthResult {
     AuthFailed(String),
     RateLimited(String),
     Error(String),
+}
+
+fn elevated_auth_precheck(uid: u32) -> HelperAuthResult {
+    let helper_path = match resolve_elevated_auth_helper_path() {
+        Some(path) => path,
+        None => {
+            return HelperAuthResult::Error(
+                "Could not find an installed mykey-elevated-auth helper.".to_string(),
+            );
+        }
+    };
+
+    let output = match Command::new(helper_path)
+        .args(["status", "--uid", &uid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            return HelperAuthResult::Error(format!("Could not launch mykey-elevated-auth: {e}"));
+        }
+    };
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match output.status.code() {
+        Some(0) => HelperAuthResult::Success,
+        Some(3) => HelperAuthResult::RateLimited(non_empty_message(
+            stderr,
+            "Elevated MyKey password auth is temporarily rate-limited.",
+        )),
+        Some(2) => HelperAuthResult::Error(non_empty_message(
+            stderr,
+            "Elevated MyKey password verification failed.",
+        )),
+        Some(code) => HelperAuthResult::Error(format!(
+            "mykey-elevated-auth exited unexpectedly with status {code}"
+        )),
+        None => HelperAuthResult::Error(
+            "mykey-elevated-auth terminated without an exit status".to_string(),
+        ),
+    }
 }
 
 fn run_elevated_auth_helper(uid: u32, purpose: &str, password: &[u8]) -> HelperAuthResult {

@@ -1,0 +1,9 @@
+[Trigger]
+Operation = Install
+Type = Package
+Target = mykey-git
+
+[Action]
+Description = Finalizing MyKey daemon setup...
+When = PostTransaction
+Exec = /usr/lib/mykey/arch-package-hook install

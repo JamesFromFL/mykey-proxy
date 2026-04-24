@@ -1,0 +1,9 @@
+[Trigger]
+Operation = Upgrade
+Type = Package
+Target = mykey-git
+
+[Action]
+Description = Refreshing MyKey daemon state...
+When = PostTransaction
+Exec = /usr/lib/mykey/arch-package-hook upgrade

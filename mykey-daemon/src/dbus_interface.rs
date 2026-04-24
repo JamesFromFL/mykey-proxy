@@ -601,6 +601,25 @@ impl DaemonInterface {
         self.pin_verify_for_uid(target_uid, pin)
     }
 
+    // ── ClearPinFailures ────────────────────────────────────────────────────
+    /// Clear PIN failure and cooldown state for `target_uid`.
+    ///
+    /// Intended for successful non-PIN MyKey local-auth stages such as
+    /// biometrics or security-key verification so stale PIN debt does not
+    /// survive a successful MyKey login.
+    async fn clear_pin_failures(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_pin_call(conn, &header, pid, target_uid)
+            .await?;
+        self.clear_pin_failures_for_uid(target_uid)
+    }
+
     // ── PinChange ────────────────────────────────────────────────────────────
     /// Change the PIN for `target_uid`.
     ///
@@ -1043,6 +1062,13 @@ impl DaemonInterface {
             .record_success(uid)
             .map_err(|e| zbus::fdo::Error::Failed(format!("PIN attempts reset failed: {e}")))?;
         Ok(true)
+    }
+
+    fn clear_pin_failures_for_uid(&self, uid: u32) -> Result<(), zbus::fdo::Error> {
+        self.state
+            .pin_store
+            .record_success(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN attempts reset failed: {e}")))
     }
 
     fn pin_reset_for_uid(&self, uid: u32) -> Result<(), zbus::fdo::Error> {

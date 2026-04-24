@@ -12,11 +12,54 @@ async fn main() {
     env_logger::init();
 
     let args: Vec<String> = std::env::args().collect();
-    let (target_uid, purpose) = parse_args(&args).unwrap_or_else(|msg| {
+    let command = parse_args(&args).unwrap_or_else(|msg| {
         eprintln!("{msg}");
         print_usage();
         std::process::exit(2);
     });
+
+    match command {
+        ElevatedCommand::Status { target_uid } => run_status(target_uid).await,
+        ElevatedCommand::Verify { target_uid, purpose } => run_verify(target_uid, purpose).await,
+    }
+}
+
+async fn run_status(target_uid: u32) {
+    if let Err(e) = ensure_uid_access(target_uid) {
+        eprintln!("{e}");
+        std::process::exit(2);
+    }
+
+    let daemon = match daemon_client::DaemonClient::connect().await {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("Could not connect to mykey-daemon: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    match daemon.elevated_auth_status(target_uid).await {
+        Ok(status) if status.retry_after_secs > 0 => {
+            daemon.disconnect().await;
+            eprintln!(
+                "Elevated MyKey password auth is rate-limited. Try again in {} seconds.",
+                status.retry_after_secs
+            );
+            std::process::exit(3);
+        }
+        Ok(_) => {
+            daemon.disconnect().await;
+            std::process::exit(0);
+        }
+        Err(e) => {
+            daemon.disconnect().await;
+            eprintln!("Could not read elevated auth status: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+async fn run_verify(target_uid: u32, purpose: String) {
 
     if let Err(e) = ensure_uid_access(target_uid) {
         eprintln!("{e}");
@@ -107,30 +150,52 @@ async fn main() {
     }
 }
 
-fn parse_args(args: &[String]) -> Result<(u32, String), String> {
-    if args.len() != 6 || args.get(1).map(|s| s.as_str()) != Some("verify") {
-        return Err("Invalid arguments.".to_string());
+enum ElevatedCommand {
+    Status { target_uid: u32 },
+    Verify { target_uid: u32, purpose: String },
+}
+
+fn parse_args(args: &[String]) -> Result<ElevatedCommand, String> {
+    match args.get(1).map(|s| s.as_str()) {
+        Some("status") => parse_status_args(args),
+        Some("verify") => parse_verify_args(args),
+        _ => Err("Invalid arguments.".to_string()),
     }
-    if args.get(2).map(|s| s.as_str()) != Some("--uid") {
+}
+
+fn parse_status_args(args: &[String]) -> Result<ElevatedCommand, String> {
+    if args.len() != 4 || args.get(2).map(|s| s.as_str()) != Some("--uid") {
+        return Err("Usage: mykey-elevated-auth status --uid <uid>".to_string());
+    }
+
+    let target_uid = args[3]
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid uid: {}", args[3]))?;
+    Ok(ElevatedCommand::Status { target_uid })
+}
+
+fn parse_verify_args(args: &[String]) -> Result<ElevatedCommand, String> {
+    if args.len() != 6 || args.get(2).map(|s| s.as_str()) != Some("--uid") {
         return Err("Missing required --uid argument.".to_string());
     }
     if args.get(4).map(|s| s.as_str()) != Some("--purpose") {
         return Err("Missing required --purpose argument.".to_string());
     }
 
-    let uid = args[3]
+    let target_uid = args[3]
         .parse::<u32>()
         .map_err(|_| format!("Invalid uid: {}", args[3]))?;
     let purpose = args[5].clone();
     match purpose.as_str() {
         "pin_enroll" | "pin_reset" | "biometric_manage" | "security_key_manage" => {
-            Ok((uid, purpose))
+            Ok(ElevatedCommand::Verify { target_uid, purpose })
         }
         _ => Err(format!("Unsupported purpose: {purpose}")),
     }
 }
 
 fn print_usage() {
+    eprintln!("Usage: mykey-elevated-auth status --uid <uid>");
     eprintln!("Usage: mykey-elevated-auth verify --uid <uid> --purpose <purpose>");
     eprintln!("Purposes: pin_enroll | pin_reset | biometric_manage | security_key_manage");
     eprintln!("Reads the Linux password from standard input.");

@@ -8,6 +8,7 @@
 // Without --features tpm2: plaintext-on-disk fallback with loud warnings.
 // This path is NOT production safe and exists only for development / CI.
 
+#[cfg(not(feature = "tpm2"))]
 use log::warn;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
@@ -142,6 +143,7 @@ fn sealed_path(credential_id_hex: &str) -> PathBuf {
     Path::new(KEY_DIR).join(format!("{}.sealed", credential_id_hex))
 }
 
+#[cfg(not(feature = "tpm2"))]
 fn fallback_path(credential_id_hex: &str) -> PathBuf {
     Path::new(KEY_DIR).join(format!("{}.key", credential_id_hex))
 }
@@ -284,7 +286,10 @@ pub fn unseal_blob(blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     // 3. AES-256-GCM decrypt.
     let cipher =
         Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("AES-GCM key init: {e}"))?;
-    let nonce = Nonce::clone_from_slice(nonce_bytes);
+    let nonce_array: [u8; 12] = nonce_bytes
+        .try_into()
+        .map_err(|_| "AES-GCM decrypt: invalid nonce length".to_string())?;
+    let nonce = Nonce::from(nonce_array);
     let plaintext = cipher
         .decrypt(&nonce, ciphertext)
         .map_err(|e| format!("AES-GCM decrypt: {e}"))?;

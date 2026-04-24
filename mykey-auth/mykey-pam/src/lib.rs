@@ -56,6 +56,19 @@ mod pam_ffi {
             item: *mut *const c_void,
         ) -> c_int;
 
+        pub fn pam_get_data(
+            pamh: *const c_void,
+            module_data_name: *const c_char,
+            data: *mut *const c_void,
+        ) -> c_int;
+
+        pub fn pam_set_data(
+            pamh: *mut c_void,
+            module_data_name: *const c_char,
+            data: *mut c_void,
+            cleanup: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, c_int)>,
+        ) -> c_int;
+
         pub fn pam_get_user(
             pamh: *const c_void,
             user: *mut *const c_char,
@@ -192,6 +205,20 @@ enum HelperPreflightResult {
     Error(String),
 }
 
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthResumeState {
+    None = 0,
+    PinFallback = 1,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthLockMessageState {
+    NotShown = 0,
+    Shown = 1,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HelperAuthMode {
     PinOnly,
@@ -204,6 +231,123 @@ enum HelperAuthInput<'a> {
     None,
     Pin(&'a [u8]),
     Password(&'a [u8]),
+}
+
+const AUTH_RESUME_STATE_KEY: &[u8] = b"mykey.auth.resume_state\0";
+const AUTH_LOCK_MESSAGE_STATE_KEY: &[u8] = b"mykey.auth.lock_message_state\0";
+
+unsafe extern "C" fn pam_auth_resume_state_cleanup(
+    _pamh: *mut libc::c_void,
+    data: *mut libc::c_void,
+    _error_status: libc::c_int,
+) {
+    if !data.is_null() {
+        drop(Box::from_raw(data as *mut AuthResumeState));
+    }
+}
+
+unsafe extern "C" fn pam_auth_lock_message_state_cleanup(
+    _pamh: *mut libc::c_void,
+    data: *mut libc::c_void,
+    _error_status: libc::c_int,
+) {
+    if !data.is_null() {
+        drop(Box::from_raw(data as *mut AuthLockMessageState));
+    }
+}
+
+unsafe fn pam_handle_ptr(handle: &pam::PamHandle) -> *mut libc::c_void {
+    handle as *const pam::PamHandle as *mut libc::c_void
+}
+
+unsafe fn pam_get_auth_resume_state(handle: &pam::PamHandle) -> AuthResumeState {
+    let mut data_ptr: *const libc::c_void = std::ptr::null();
+    let rc = pam_ffi::pam_get_data(
+        pam_handle_ptr(handle),
+        AUTH_RESUME_STATE_KEY.as_ptr() as *const libc::c_char,
+        &mut data_ptr,
+    );
+    if rc != 0 || data_ptr.is_null() {
+        return AuthResumeState::None;
+    }
+
+    match *(data_ptr as *const AuthResumeState) {
+        AuthResumeState::PinFallback => AuthResumeState::PinFallback,
+        AuthResumeState::None => AuthResumeState::None,
+    }
+}
+
+unsafe fn pam_set_auth_resume_state(
+    handle: &pam::PamHandle,
+    state: AuthResumeState,
+) -> Result<(), ()> {
+    let mut data_ptr: *const libc::c_void = std::ptr::null();
+    let handle_ptr = pam_handle_ptr(handle);
+    let key_ptr = AUTH_RESUME_STATE_KEY.as_ptr() as *const libc::c_char;
+
+    if pam_ffi::pam_get_data(handle_ptr, key_ptr, &mut data_ptr) == 0 && !data_ptr.is_null() {
+        *(data_ptr as *mut AuthResumeState) = state;
+        return Ok(());
+    }
+
+    let raw = Box::into_raw(Box::new(state));
+    let rc = pam_ffi::pam_set_data(
+        handle_ptr,
+        key_ptr,
+        raw as *mut libc::c_void,
+        Some(pam_auth_resume_state_cleanup),
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        drop(Box::from_raw(raw));
+        Err(())
+    }
+}
+
+unsafe fn pam_get_auth_lock_message_state(handle: &pam::PamHandle) -> AuthLockMessageState {
+    let mut data_ptr: *const libc::c_void = std::ptr::null();
+    let rc = pam_ffi::pam_get_data(
+        pam_handle_ptr(handle),
+        AUTH_LOCK_MESSAGE_STATE_KEY.as_ptr() as *const libc::c_char,
+        &mut data_ptr,
+    );
+    if rc != 0 || data_ptr.is_null() {
+        return AuthLockMessageState::NotShown;
+    }
+
+    match *(data_ptr as *const AuthLockMessageState) {
+        AuthLockMessageState::Shown => AuthLockMessageState::Shown,
+        AuthLockMessageState::NotShown => AuthLockMessageState::NotShown,
+    }
+}
+
+unsafe fn pam_set_auth_lock_message_state(
+    handle: &pam::PamHandle,
+    state: AuthLockMessageState,
+) -> Result<(), ()> {
+    let mut data_ptr: *const libc::c_void = std::ptr::null();
+    let handle_ptr = pam_handle_ptr(handle);
+    let key_ptr = AUTH_LOCK_MESSAGE_STATE_KEY.as_ptr() as *const libc::c_char;
+
+    if pam_ffi::pam_get_data(handle_ptr, key_ptr, &mut data_ptr) == 0 && !data_ptr.is_null() {
+        *(data_ptr as *mut AuthLockMessageState) = state;
+        return Ok(());
+    }
+
+    let raw = Box::into_raw(Box::new(state));
+    let rc = pam_ffi::pam_set_data(
+        handle_ptr,
+        key_ptr,
+        raw as *mut libc::c_void,
+        Some(pam_auth_lock_message_state_cleanup),
+    );
+    if rc == 0 {
+        Ok(())
+    } else {
+        drop(Box::from_raw(raw));
+        Err(())
+    }
 }
 
 fn run_auth_helper(uid: u32, input: HelperAuthInput<'_>) -> HelperAuthResult {
@@ -244,8 +388,14 @@ fn run_auth_helper(uid: u32, input: HelperAuthInput<'_>) -> HelperAuthResult {
     }
 }
 
-fn run_preflight_helper(uid: u32) -> HelperPreflightResult {
-    match run_helper_command(&["preflight", "--uid", &uid.to_string()], None) {
+fn run_preflight_helper(uid: u32, force_pin_fallback: bool) -> HelperPreflightResult {
+    let uid_arg = uid.to_string();
+    let mut args = vec!["preflight", "--uid", uid_arg.as_str()];
+    if force_pin_fallback {
+        args.push("--pin-fallback");
+    }
+
+    match run_helper_command(&args, None) {
         Ok((Some(0), stdout, _)) => match parse_preflight_mode(&stdout) {
             Ok(mode) => HelperPreflightResult::Ready(mode),
             Err(e) => HelperPreflightResult::Error(e),
@@ -374,6 +524,22 @@ unsafe fn pam_info(handle: &pam::PamHandle, msg: &str) {
     pam_message(handle, pam_ffi::PAM_TEXT_INFO, msg);
 }
 
+unsafe fn pam_locked_once(handle: &pam::PamHandle, msg: &str) {
+    if pam_get_auth_lock_message_state(handle) == AuthLockMessageState::Shown {
+        return;
+    }
+
+    pam_error(
+        handle,
+        if msg.is_empty() {
+            "MyKey authentication failed."
+        } else {
+            msg
+        },
+    );
+    let _ = pam_set_auth_lock_message_state(handle, AuthLockMessageState::Shown);
+}
+
 pub struct MyKeyModule;
 
 impl PamModule for MyKeyModule {
@@ -401,50 +567,111 @@ impl PamModule for MyKeyModule {
             }
         };
 
-        let mode = match run_preflight_helper(uid) {
-            HelperPreflightResult::Ready(mode) => mode,
-            HelperPreflightResult::Ignore => return PamReturnCode::Ignore,
-            HelperPreflightResult::Locked(msg) | HelperPreflightResult::Error(msg) => {
-                unsafe {
-                    pam_error(
-                        handle,
-                        if msg.is_empty() {
-                            "MyKey authentication failed."
-                        } else {
-                            &msg
-                        },
-                    );
+        let resume_pin_fallback =
+            unsafe { pam_get_auth_resume_state(handle) == AuthResumeState::PinFallback };
+
+        let mode = if resume_pin_fallback {
+            HelperAuthMode::PinOnly
+        } else {
+            match run_preflight_helper(uid, false) {
+                HelperPreflightResult::Ready(mode) => mode,
+                HelperPreflightResult::Ignore => return PamReturnCode::Ignore,
+                HelperPreflightResult::Locked(msg) => {
+                    unsafe {
+                        pam_locked_once(handle, &msg);
+                    }
+                    return PamReturnCode::Auth_Err;
                 }
-                return PamReturnCode::Auth_Err;
+                HelperPreflightResult::Error(msg) => {
+                    unsafe {
+                        pam_error(
+                            handle,
+                            if msg.is_empty() {
+                                "MyKey authentication failed."
+                            } else {
+                                &msg
+                            },
+                        );
+                    }
+                    return PamReturnCode::Auth_Err;
+                }
             }
         };
 
-        let first_result = match &mode {
-            HelperAuthMode::PinOnly => prompt_and_verify_pin(handle, uid, "MyKey PIN: "),
-            HelperAuthMode::PasswordFallback => {
-                prompt_and_verify_password(handle, uid, "Linux account password: ")
-            }
-            HelperAuthMode::BiometricFirst { backends } => {
-                if let Some(message) = biometric_prompt_message(backends) {
+        if resume_pin_fallback {
+            match run_preflight_helper(uid, true) {
+                HelperPreflightResult::Ready(_) => {}
+                HelperPreflightResult::Ignore => {
                     unsafe {
-                        pam_info(handle, &message);
+                        pam_error(handle, "MyKey PIN fallback is not configured.");
                     }
+                    return PamReturnCode::Auth_Err;
                 }
-                run_auth_helper(uid, HelperAuthInput::None)
+                HelperPreflightResult::Locked(msg) => {
+                    unsafe {
+                        pam_locked_once(
+                            handle,
+                            if msg.is_empty() {
+                                "MyKey PIN fallback is not available."
+                            } else {
+                                &msg
+                            },
+                        );
+                    }
+                    return PamReturnCode::Auth_Err;
+                }
+                HelperPreflightResult::Error(msg) => {
+                    unsafe {
+                        pam_error(
+                            handle,
+                            if msg.is_empty() {
+                                "MyKey PIN fallback is not available."
+                            } else {
+                                &msg
+                            },
+                        );
+                    }
+                    return PamReturnCode::Auth_Err;
+                }
             }
-            HelperAuthMode::SecurityKeyFirst => {
-                unsafe {
-                    pam_info(
-                        handle,
-                        "MyKey security-key verification in progress. Touch your enrolled key now.",
-                    );
+        }
+
+        let first_result = if resume_pin_fallback {
+            prompt_and_verify_pin(handle, uid, "MyKey PIN fallback: ")
+        } else {
+            match &mode {
+                HelperAuthMode::PinOnly => prompt_and_verify_pin(handle, uid, "MyKey PIN: "),
+                HelperAuthMode::PasswordFallback => {
+                    prompt_and_verify_password(handle, uid, "Linux account password: ")
                 }
-                run_auth_helper(uid, HelperAuthInput::None)
+                HelperAuthMode::BiometricFirst { backends } => {
+                    if let Some(message) = biometric_prompt_message(backends) {
+                        unsafe {
+                            pam_info(handle, &message);
+                        }
+                    }
+                    run_auth_helper(uid, HelperAuthInput::None)
+                }
+                HelperAuthMode::SecurityKeyFirst => {
+                    unsafe {
+                        pam_info(
+                            handle,
+                            "MyKey security-key verification in progress. Touch your enrolled key now.",
+                        );
+                    }
+                    run_auth_helper(uid, HelperAuthInput::None)
+                }
             }
         };
 
         match first_result {
-            HelperAuthResult::Success => PamReturnCode::Success,
+            HelperAuthResult::Success => {
+                let _ = unsafe { pam_set_auth_resume_state(handle, AuthResumeState::None) };
+                let _ = unsafe {
+                    pam_set_auth_lock_message_state(handle, AuthLockMessageState::NotShown)
+                };
+                PamReturnCode::Success
+            }
             HelperAuthResult::AuthFailed => {
                 unsafe {
                     pam_error(
@@ -470,13 +697,20 @@ impl PamModule for MyKeyModule {
                 PamReturnCode::Auth_Err
             }
             HelperAuthResult::PinFallbackRequired(msg) => {
+                let _ = unsafe { pam_set_auth_resume_state(handle, AuthResumeState::PinFallback) };
                 if !msg.is_empty() {
                     unsafe {
                         pam_info(handle, &msg);
                     }
                 }
                 match prompt_and_verify_pin(handle, uid, "MyKey PIN fallback: ") {
-                    HelperAuthResult::Success => PamReturnCode::Success,
+                    HelperAuthResult::Success => {
+                        let _ = unsafe { pam_set_auth_resume_state(handle, AuthResumeState::None) };
+                        let _ = unsafe {
+                            pam_set_auth_lock_message_state(handle, AuthLockMessageState::NotShown)
+                        };
+                        PamReturnCode::Success
+                    }
                     HelperAuthResult::AuthFailed => {
                         unsafe {
                             pam_error(handle, "Incorrect MyKey PIN.");
@@ -484,6 +718,7 @@ impl PamModule for MyKeyModule {
                         PamReturnCode::Auth_Err
                     }
                     HelperAuthResult::NotConfigured => {
+                        let _ = unsafe { pam_set_auth_resume_state(handle, AuthResumeState::None) };
                         unsafe {
                             pam_error(handle, "MyKey PIN fallback is not configured.");
                         }
@@ -495,7 +730,20 @@ impl PamModule for MyKeyModule {
                         }
                         PamReturnCode::Auth_Err
                     }
-                    HelperAuthResult::Locked(msg) | HelperAuthResult::Error(msg) => {
+                    HelperAuthResult::Locked(msg) => {
+                        unsafe {
+                            pam_locked_once(
+                                handle,
+                                if msg.is_empty() {
+                                    "MyKey authentication failed."
+                                } else {
+                                    &msg
+                                },
+                            );
+                        }
+                        PamReturnCode::Auth_Err
+                    }
+                    HelperAuthResult::Error(msg) => {
                         unsafe {
                             pam_error(
                                 handle,
@@ -510,7 +758,34 @@ impl PamModule for MyKeyModule {
                     }
                 }
             }
-            HelperAuthResult::Locked(msg) | HelperAuthResult::Error(msg) => {
+            HelperAuthResult::Locked(msg) => {
+                if matches!(
+                    mode,
+                    HelperAuthMode::BiometricFirst { .. } | HelperAuthMode::SecurityKeyFirst
+                ) {
+                    let _ =
+                        unsafe { pam_set_auth_resume_state(handle, AuthResumeState::PinFallback) };
+                }
+                unsafe {
+                    pam_locked_once(
+                        handle,
+                        if msg.is_empty() {
+                            "MyKey authentication failed."
+                        } else {
+                            &msg
+                        },
+                    );
+                }
+                PamReturnCode::Auth_Err
+            }
+            HelperAuthResult::Error(msg) => {
+                if matches!(
+                    mode,
+                    HelperAuthMode::BiometricFirst { .. } | HelperAuthMode::SecurityKeyFirst
+                ) {
+                    let _ =
+                        unsafe { pam_set_auth_resume_state(handle, AuthResumeState::PinFallback) };
+                }
                 unsafe {
                     pam_error(
                         handle,

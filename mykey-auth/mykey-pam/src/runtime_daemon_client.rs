@@ -45,6 +45,7 @@ trait DaemonIface {
     async fn disable_biometric_backend(&self, pid: u32, target_uid: u32) -> zbus::Result<()>;
     async fn pin_status(&self, pid: u32, target_uid: u32) -> zbus::Result<(bool, u64, u32)>;
     async fn pin_verify(&self, pid: u32, target_uid: u32, pin: Vec<u8>) -> zbus::Result<bool>;
+    async fn clear_pin_failures(&self, pid: u32, target_uid: u32) -> zbus::Result<()>;
     async fn disconnect(&self, pid: u32) -> zbus::Result<()>;
 }
 
@@ -240,6 +241,15 @@ impl DaemonClient {
             .pin_verify(self.pid, target_uid, pin.to_vec())
             .await
             .map_err(|e| format!("D-Bus PinVerify failed: {e}"))
+    }
+
+    pub async fn clear_pin_failures(&self, target_uid: u32) -> Result<(), String> {
+        debug!("[mykey-auth] ClearPinFailures (target_uid={target_uid})");
+        make_proxy(&self.conn)
+            .await?
+            .clear_pin_failures(self.pid, target_uid)
+            .await
+            .map_err(|e| format!("D-Bus ClearPinFailures failed: {e}"))
     }
 
     pub async fn disconnect(self) {

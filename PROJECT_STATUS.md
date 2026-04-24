@@ -1,6 +1,6 @@
 # MyKey Project Status
 
-Last updated: 2026-04-23
+Last updated: 2026-04-24
 
 ## Purpose
 - Canonical running project status and to-do document for MyKey release hardening.
@@ -18,10 +18,9 @@ Last updated: 2026-04-23
   - enroll now unlocks source collections before bulk secret reads, so locked source keyrings fail with a prompt instead of partial-read errors.
   - enroll staging now activates inside the writable per-user MyKey secrets store instead of requiring writes to `/etc/mykey`.
 - `mykey-pin`
-  - active redesign target
-  - not yet release-ready
-  - Level 1 PIN architecture is usable and validated
-  - next auth direction is a unified `pam_mykey.so` local-auth layer that orchestrates existing backends and keeps MyKey PIN as the local fallback
+  - current PIN auth path is release-ready for the validated local-auth scope
+  - Level 1 PIN architecture is usable and host-validated
+  - MyKey PIN remains the local fallback backend behind `pam_mykey.so`
   - first-time PIN setup and reset now route through a dedicated elevated-password helper and password-only PAM service
 - `mykey-auth`
   - local-auth subtree now groups:
@@ -35,16 +34,18 @@ Last updated: 2026-04-23
   - `mykey-security-key` now owns security-key enrollment, status, unenroll, and direct provider testing
   - `mykey-auth setup` now exists as the guided auth-first entrypoint over PIN, optional security key, optional biometrics, required base PAM takeover, and optional login takeover
   - `sudo mykey-auth setup` now targets the invoking Linux account correctly during PIN work instead of root
+  - the guided setup, disable, and re-enable lifecycle is now live-validated on-host for the current release scope
 - `pam_mykey`
   - Phase A pin-backed base is now in repo through `mykey-auth/mykey-pam` and the `mykey-auth` helper
   - Phase A live validation is complete through `pamtester`
+  - initial host validation is now complete for `sudo`, `polkit-1`, and the opt-in `gdm-fingerprint` target
   - runtime auth now follows daemon local-auth policy instead of hardcoding PIN-only behavior
   - biometric-first runtime auth now exists for supported `fprintd` and `Howdy` policy backends, with capped attempts, explicit verifier timeout/cancellation control, and MyKey PIN fallback
   - security-key-first runtime auth now exists for the `pam_u2f` policy backend, with MyKey PIN fallback
-  - biometric runtime auth still needs broad host-installed calibration across supported PAM surfaces
+  - broader login-manager and distro-surface calibration is still open beyond the validated targets above
   - security-key runtime auth still needs real hardware validation
   - local-auth policy now lives in daemon-owned state instead of being hardcoded in the helper
-  - backend orchestration, policy enforcement, and supported PAM target integration remain open work
+  - remaining work is provider polish, real security-key hardware validation, and packaging cleanup rather than missing core orchestration
 
 ---
 
@@ -135,7 +136,7 @@ Last updated: 2026-04-23
    - keep hardening for `mykey-pin`
    - stop affecting normal password fallback flows like `sudo` password prompts
    - daemon-side polkit/password verification no longer imposes a MyKey-managed cooldown
-   - current PIN lockout schedule remains 3 free failed attempts, then 1m → 5m → 15m → 30m → 1h → 2h → 5h
+   - current PIN lockout schedule is 2 free failed attempts, then 1m → 5m → 15m → 30m → 1h → 2h → 5h starting on the 3rd bad PIN
 
 15. [x] `Moderate` `mykey-pin` Add explicit PIN policy.
    - first-release PIN policy is numeric-only
@@ -143,7 +144,7 @@ Last updated: 2026-04-23
    - maximum length: 12 digits
    - empty and non-numeric PINs are rejected in both the CLI and daemon API
 
-16. [ ] `Critical` `pam_mykey` Build `pam_mykey.so` into the final MyKey-managed local-auth entrypoint.
+16. [x] `Critical` `pam_mykey` Build `pam_mykey.so` into the final MyKey-managed local-auth entrypoint.
    - replace the long-term need for separate user-managed PAM ordering between biometrics, security keys, PIN, and password
    - make `pam_mykey.so` the first MyKey auth module for supported system auth flows such as `sudo`, lock screen, login-adjacent prompts, and other safe local PAM targets
    - make MyKey responsible for installing and maintaining its supported PAM integration points so auth reaches MyKey first
@@ -152,6 +153,7 @@ Last updated: 2026-04-23
    - Phase A live validation is complete with `pamtester`
    - normal local auth should be MyKey-managed and should not rely on users hand-editing PAM ordering
    - elevated actions must stay outside normal biometric-only auth and continue to require stronger verification
+   - live host validation is now complete for `sudo`, `polkit-1`, and opt-in `gdm-fingerprint`, including clean disable/re-enable teardown and bring-up
 
 17. [x] `Critical` `local auth policy` Encode the hard MyKey auth rules in daemon-owned policy.
    - MyKey must orchestrate existing system auth stacks instead of reimplementing biometrics or security-key verification itself
@@ -167,13 +169,14 @@ Last updated: 2026-04-23
    - elevated PIN setup/reset and biometric management now use a dedicated `mykey-elevated-auth` helper plus a password-only PAM service instead of the generic polkit presence path
    - normal password fallback now stays inside MyKey: `pam_mykey.so` prompts for Linux account password through `mykey-auth` and the password-only PAM service instead of falling through to downstream password modules
 
-18. [ ] `Important` `mykey-biometrics` Add a dedicated biometric setup and management helper on top of existing system stacks.
+18. [x] `Important` `mykey-biometrics` Add a dedicated biometric setup and management helper on top of existing system stacks.
    - first scaffold now exists through `mykey-auth biometrics` with `enroll`, `unenroll`, `status`, and `exit`
    - support backend selection for `fprintd` and `Howdy`
    - detect whether the selected backend is installed and offer install guidance or install integration where appropriate
    - drive backend enrollment, backend validation, MyKey policy enablement, and final verification
    - require a PIN before enabling biometrics and explain the fallback policy clearly during setup
    - remove the need for users to hand-edit PAM configuration to get MyKey biometrics working
+   - setup, runtime auth, policy re-enable, and policy teardown are now live-validated on-host for the `fprintd` path
 
 19. [ ] `Important` `mykey-security-key` Add a dedicated security-key setup and management helper on top of existing system stacks.
    - `mykey-security-key` now exists with `enroll`, `status`, `unenroll`, and `test`
@@ -184,7 +187,7 @@ Last updated: 2026-04-23
    - run live enrollment, status, test, and unenroll validation once a real hardware security key is available
    - keep security-key auth as a first-class local-auth backend alongside biometrics and MyKey PIN
 
-20. [ ] `Important` `local auth policy` Add backend-first local auth orchestration with MyKey-managed fallback.
+20. [x] `Important` `local auth policy` Add backend-first local auth orchestration with MyKey-managed fallback.
    - daemon-owned local-auth policy state now exists under `/etc/mykey/auth`
    - `mykey-auth` now reads daemon policy instead of hardcoding PIN-only behavior
    - existing pin-only users are backfilled automatically into local-auth policy on first status read
@@ -201,7 +204,7 @@ Last updated: 2026-04-23
      2. [x] harden the biometric verifier layer so fingerprint and face auth have explicit timeout/cancellation behavior and do not rely on ad hoc fallback semantics
      3. [x] implement the biometric group stage so multiple configured biometric providers can race and satisfy auth on first success
      4. [x] wire the final failure-closed runtime chain inside `pam_mykey.so`: biometrics group -> security key -> MyKey PIN
-   - remaining work here is live host validation and provider polish, not missing staged-chain wiring
+   - live host validation is now complete for the current PIN + biometric release scope; remaining work is wider login-manager calibration, provider polish, and real security-key hardware validation rather than missing staged-chain wiring
 
 21. [ ] `Moderate` `packaging` Align final package behavior with GUI and CLI release model.
    - `mykey-manager` as GUI frontend
@@ -303,7 +306,9 @@ Last updated: 2026-04-23
      - `packaging/arch/mykey.tmpfiles`
    - Arch post-install guidance now treats auth-first setup as the default rollout:
      `sudo mykey-auth setup`, then optional `mykey-migrate --enroll` for Secret Service takeover
-   - package install now auto-enables and starts `mykey-daemon` so auth setup works immediately after installation
+   - package install now finalizes `mykey-daemon` through a post-transaction hook so auth setup works immediately after installation
+   - the same hook now regenerates `/etc/mykey/trusted-binaries.json` from the final installed daemon binary instead of the pre-package build artifact
+   - the packaged daemon service now carries TPM access through `SupplementaryGroups=tss` instead of package-time mutation of the `mykey` service account
    - move package-owned artifacts out of `/usr/local` and user-home installation logic
    - demote `scripts/install.sh` and `scripts/uninstall.sh` into developer/setup tooling instead of distribution tooling
    - keep daemon-owned machine state under `/etc/mykey`, but keep Secret Service user state under the user's MyKey data dir instead of package-owned `/etc` paths
@@ -348,7 +353,7 @@ Last updated: 2026-04-23
 - [x] Move PIN verification, change, reset, and lockout updates fully behind daemon methods.
 - [x] Revisit daemon-side brute-force behavior so non-PIN password flows are not over-hardened.
   - daemon-side polkit/password verification no longer carries a MyKey-managed cooldown
-- [x] Keep the current PIN lockout schedule at 3 free attempts, then 1m → 5m → 15m → 30m → 1h → 2h → 5h.
+- [x] Keep the current PIN lockout schedule at 2 free attempts, then 1m → 5m → 15m → 30m → 1h → 2h → 5h starting on the 3rd bad PIN.
 
 #### Moderate
 - [ ] Later move from sealed verifier behavior toward a stronger TPM-backed local auth protector.
@@ -544,10 +549,18 @@ Last updated: 2026-04-23
 - [ ] Run live security-key validation once hardware is available.
   - enroll, status, test, unenroll, and security-key-first `pam_mykey.so` auth still need a real-key pass on a host with `pam_u2f`
 - [ ] Run a full host-installed auth calibration pass once the local-auth surface is further along.
-  - defer the real system install until more of the auth stack is worth calibrating together
-  - validate the dedicated elevated-password path against a live PAM and fingerprint configuration
-  - validate that elevated-password backoff stays separate from MyKey PIN lockout
+  - live package install and host-side auth calibration are now in progress on an Arch test machine
+  - the current PIN + biometric release scope is now host-validated for `sudo`, `polkit-1`, and opt-in `gdm-fingerprint`
+  - dedicated elevated-password flow is now live-validated for `mykey pin reset` and `sudo mykey-auth biometrics`, both requiring the Linux account password instead of fingerprint or MyKey PIN
+  - elevated-management frontends now precheck the dedicated cooldown before prompting for the Linux password, and that UX fix is now live-validated on-host
+  - `pamtester polkit-1 "$USER" authenticate` is now live-validated for both successful fingerprint auth and fingerprint failure falling back to MyKey PIN
+  - `sudo true` is now live-validated for successful fingerprint auth, biometric failure falling back to PIN, correct PIN lockout thresholding, and retries staying pinned inside MyKey after fallback begins
+  - `sudo mykey-auth disable` is now live-validated for clean teardown of base and selected login targets, with native auth resuming afterward
+  - `sudo mykey-auth setup` is now live-validated for clean re-enable of base targets, while leaving login targets unchanged when the operator declines login takeover
+  - elevated-password backoff is now live-validated as separate from MyKey PIN lockout
   - validate the install/package surface on a real machine instead of only through repo-side builds
+  - the last host install exposed three package-era bugs: TPM access for the `mykey` daemon user, trusted-binary hash generation from the pre-package daemon artifact, and daemon startup timing during `post_install()`
+  - repo-side fixes are now staged through `SupplementaryGroups=tss` and a post-transaction package hook, but that package path still needs a fresh host re-test before it can be called stable
 
 ---
 
@@ -592,6 +605,7 @@ Last updated: 2026-04-23
 - [ ] Revisit `mykey-daemon` password-side brute-force behavior after Level 1 `mykey-pin` is usable.
 - [ ] Review remaining modules one at a time before first release.
 - [ ] Keep `docs/architecture.md` and `docs/threat-model.md` updated as the platform design changes instead of letting them drift behind the code again.
+- [ ] Track the `tss-esapi -> picky-asn1-x509` future-incompat warning in the TPM dependency stack and update or pin that chain before a future Rust release turns it into a hard build failure.
 
 ### Low
 - [ ] Keep GUI/package integration notes separate from backend correctness work until backend paths are stable.
@@ -783,3 +797,17 @@ Grouped by day, oldest first.
 - Added the guided `mykey-auth setup` flow for daemon readiness checks, PIN-first bring-up, optional security key and biometrics, required base PAM takeover, and optional login takeover.
 - Updated Arch packaging docs and scriptlets so package install now brings up `mykey-daemon` automatically and points operators at `sudo mykey-auth setup` as the primary next step.
 - Fixed the setup path so `mykey-pin` honors `SUDO_UID` and configures the invoking Linux account instead of root when launched through `sudo`.
+- Trimmed redundant biometric setup menus so pre-printed action and device lists now go straight to `Selection:` without being restated by the prompt helper.
+- Fail-closed MyKey-managed PAM targets with `default=die` and taught `pam_mykey.so` to keep retries pinned to MyKey PIN fallback within the same PAM transaction after biometrics have already been exhausted.
+- Cleared stale PIN failure debt after successful biometric or security-key auth so a good MyKey login resets the PIN counter instead of preserving old lockout history.
+- Kept locked PIN fallback retries inside MyKey during the same PAM transaction so `sudo` no longer restarts fingerprint after PIN fallback is already locked.
+
+### 2026-04-24
+- Live-validated the elevated-password path on-host for `mykey pin reset` and `mykey-pin set`, including separate cooldown behavior from the MyKey PIN lockout path.
+- Added elevated-management cooldown prechecks so `mykey pin reset`, `mykey-auth biometrics`, and `mykey-security-key` no longer prompt for the Linux password while elevated auth is already rate-limited.
+- Live-validated `pamtester polkit-1 "$USER" authenticate` for both successful fingerprint auth and fingerprint failure falling back to MyKey PIN.
+- Live-validated clean PAM teardown through `sudo mykey-auth disable`, with native `sudo` auth resuming after MyKey-managed blocks were removed.
+- Live-validated `sudo mykey-auth setup` as a repeatable re-enable path for base PAM targets, with login takeover remaining opt-in and left untouched when declined.
+- Tightened PAM-facing lockout UX so the lockout-triggering PIN failure now reports the active cooldown immediately, and locked-PIN retries inside the same PAM conversation no longer spam the same lockout message on every retry.
+- Clarified `mykey-pin reset` so operators are told that biometric and security-key stages tied to the old PIN must be reconfigured after a new PIN is set.
+- Hardened the Arch package path by moving daemon finalization into post-transaction hooks, regenerating `trusted-binaries.json` from the final installed daemon binary, and shifting TPM access onto the daemon service unit through `SupplementaryGroups=tss`.

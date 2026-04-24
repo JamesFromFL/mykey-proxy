@@ -151,8 +151,9 @@ Important current reality:
 - the daemon now computes effective local-auth policy outputs such as password
   fallback allowance, elevated-action password requirements, and biometric
   attempt limits instead of exposing only raw stored settings
-- broad host-installed calibration of biometric-first PAM behavior is still
-  pending
+- initial host-installed calibration of biometric-first PAM behavior is now
+  complete for `sudo`, `polkit-1`, and the opt-in `gdm-fingerprint` target,
+  but broader login-manager and distro-surface calibration is still pending
 - security-key runtime auth is now wired, but still needs real hardware
   validation on a host with `pam_u2f`
 
@@ -484,15 +485,17 @@ What is live today:
 What is not complete yet:
 
 - live hardware security-key validation
-- broad host-installed validation of biometric-first behavior across supported
-  PAM surfaces
+- broader host-installed validation of biometric-first behavior across
+  supported PAM surfaces beyond `sudo`, `polkit-1`, and opt-in
+  `gdm-fingerprint`
 
 So the current architecture should be read as:
 
 - daemon-owned staged local auth is real
 - biometrics now participate in the live `pam_mykey.so` runtime path, including
-  the multi-provider first-success stage, but the host-validation story is
-  still incomplete
+  the multi-provider first-success stage, and the current host validation now
+  covers `sudo`, `polkit-1`, and opt-in `gdm-fingerprint`, but broader
+  login-manager and distro-surface calibration is still incomplete
 - security keys now participate in the live `pam_mykey.so` runtime path, but
   still need hardware validation and broader host-installed calibration
 

@@ -63,10 +63,7 @@ pub async fn run(target_uid: u32, system_username: &str) {
         println!("  3. Status");
         println!("  4. Exit");
 
-        match prompt_menu_selection(
-            "Select an action",
-            &["Enroll", "Unenroll", "Status", "Exit"],
-        ) {
+        match prompt_existing_menu_selection(4, 0) {
             Ok(0) => {
                 if let Err(e) = enroll_flow(&client, target_uid, system_username).await {
                     eprintln!("{e}");
@@ -607,16 +604,7 @@ async fn unenroll_flow(
     println!("  4. Remove both provider data sets and disable biometric auth");
     println!("  5. Cancel");
 
-    match prompt_menu_selection(
-        "Choose an unenroll action",
-        &[
-            "Disable biometric auth only",
-            "Delete all fingerprint data",
-            "Delete all face data",
-            "Delete both fingerprint and face data",
-            "Cancel",
-        ],
-    )? {
+    match prompt_existing_menu_selection(5, 0)? {
         0 => {
             require_elevated_password(
                 target_uid,
@@ -960,11 +948,7 @@ fn choose_device_label(
         for (idx, device) in detected_devices.iter().enumerate() {
             println!("  {}. {}", idx + 1, device);
         }
-        let options: Vec<&str> = detected_devices
-            .iter()
-            .map(|device| device.as_str())
-            .collect();
-        let idx = prompt_menu_selection("Confirm the device to use", &options)?;
+        let idx = prompt_existing_menu_selection(detected_devices.len(), 0)?;
         Ok(Some(detected_devices[idx].clone()))
     }
 }
@@ -1086,6 +1070,13 @@ fingerprint and face templates remain owned by the upstream biometric stacks."
 }
 
 fn require_elevated_password(target_uid: u32, purpose: &str, intro: &str) -> Result<(), String> {
+    match elevated_auth_precheck(target_uid) {
+        HelperAuthResult::Success => {}
+        HelperAuthResult::AuthFailed(message)
+        | HelperAuthResult::RateLimited(message)
+        | HelperAuthResult::Error(message) => return Err(message),
+    }
+
     println!("{intro}");
     let password = rpassword::prompt_password("Linux account password: ")
         .map(Zeroizing::new)
@@ -1104,6 +1095,48 @@ enum HelperAuthResult {
     AuthFailed(String),
     RateLimited(String),
     Error(String),
+}
+
+fn elevated_auth_precheck(uid: u32) -> HelperAuthResult {
+    let helper_path = match resolve_elevated_auth_helper_path() {
+        Some(path) => path,
+        None => {
+            return HelperAuthResult::Error(
+                "Could not find an installed mykey-elevated-auth helper.".to_string(),
+            );
+        }
+    };
+
+    let output = match Command::new(helper_path)
+        .args(["status", "--uid", &uid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            return HelperAuthResult::Error(format!("Could not launch mykey-elevated-auth: {e}"));
+        }
+    };
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match output.status.code() {
+        Some(0) => HelperAuthResult::Success,
+        Some(3) => HelperAuthResult::RateLimited(non_empty_message(
+            stderr,
+            "Elevated MyKey password auth is temporarily rate-limited.",
+        )),
+        Some(2) => HelperAuthResult::Error(non_empty_message(
+            stderr,
+            "Elevated MyKey password verification failed.",
+        )),
+        Some(code) => HelperAuthResult::Error(format!(
+            "mykey-elevated-auth exited unexpectedly with status {code}"
+        )),
+        None => HelperAuthResult::Error(
+            "mykey-elevated-auth terminated without an exit status".to_string(),
+        ),
+    }
 }
 
 fn run_elevated_auth_helper(uid: u32, purpose: &str, password: &[u8]) -> HelperAuthResult {
@@ -1233,6 +1266,27 @@ fn prompt_yes_no(prompt: &str, default: bool) -> Result<bool, String> {
 
 fn prompt_menu_selection(prompt: &str, options: &[&str]) -> Result<usize, String> {
     prompt_menu_selection_with_default(prompt, options, 0)
+}
+
+fn prompt_existing_menu_selection(option_count: usize, default_index: usize) -> Result<usize, String> {
+    loop {
+        print!("Selection: ");
+        io::stdout()
+            .flush()
+            .map_err(|e| format!("Could not flush stdout: {e}"))?;
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| format!("Could not read response: {e}"))?;
+        let input = line.trim();
+        if input.is_empty() {
+            return Ok(default_index);
+        }
+        match input.parse::<usize>() {
+            Ok(value) if value >= 1 && value <= option_count => return Ok(value - 1),
+            _ => println!("Invalid selection."),
+        }
+    }
 }
 
 fn prompt_menu_selection_with_default(

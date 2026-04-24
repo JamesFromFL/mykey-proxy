@@ -32,8 +32,14 @@ The package should not own:
 
 The one service-side exception is `mykey-daemon`:
 
-- installation should enable and start `mykey-daemon` before the operator runs
+- package install should leave `mykey-daemon` active before the operator runs
   any auth setup commands
+- the Arch package now does this through a post-transaction hook that:
+  - regenerates `/etc/mykey/trusted-binaries.json` from the final installed
+    `/usr/bin/mykey-daemon`
+  - reloads systemd state
+  - enables and starts `mykey-daemon` on first install
+  - restarts `mykey-daemon` on upgrade when the service is already enabled
 - user-session services such as `mykey-secrets` and `mykey-tray` should still
   remain explicit user actions
 
@@ -67,6 +73,10 @@ The package payload also needs to carry the dedicated elevated-management auth
 surface, including `mykey-elevated-auth` and `/etc/pam.d/mykey-elevated-auth`,
 so MyKey does not depend on a broad shared PAM stack for setup and reset work.
 
+The daemon service itself now carries TPM access through
+`SupplementaryGroups=tss` instead of relying on package-time mutation of the
+`mykey` service account.
+
 The current package payload also includes:
 
 - `mykey-security-key`
@@ -86,6 +96,8 @@ Important follow-up areas still include:
 - daemon logging cleanup
 - tighter polkit defaults
 - final package-safe ownership of all MyKey state paths
+- re-validating install and upgrade on a live Arch host after the new
+  post-transaction hook and service-group changes
 
 For the current detailed split of package payload vs setup vs removed installer
 behavior, use [TRANSITION.md](../../packaging/arch/TRANSITION.md).

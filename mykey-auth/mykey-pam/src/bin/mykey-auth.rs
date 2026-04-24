@@ -48,7 +48,10 @@ async fn main() {
 
     match parsed {
         Command::Authenticate { target_uid, input } => run_authenticate(target_uid, input).await,
-        Command::Preflight { target_uid } => run_preflight(target_uid).await,
+        Command::Preflight {
+            target_uid,
+            force_pin_fallback,
+        } => run_preflight(target_uid, force_pin_fallback).await,
         Command::Setup => run_setup().await,
         Command::Enable => run_enable().await,
         Command::Disable => run_disable(),
@@ -67,6 +70,7 @@ enum Command {
     },
     Preflight {
         target_uid: u32,
+        force_pin_fallback: bool,
     },
     Setup,
     Enable,
@@ -174,6 +178,7 @@ fn parse_authenticate_command(args: &[String]) -> Result<Command, String> {
 
 fn parse_preflight_command(args: &[String]) -> Result<Command, String> {
     let mut target_uid = None;
+    let mut force_pin_fallback = false;
     let mut idx = 2;
     while idx < args.len() {
         match args[idx].as_str() {
@@ -188,6 +193,10 @@ fn parse_preflight_command(args: &[String]) -> Result<Command, String> {
                 );
                 idx += 2;
             }
+            "--pin-fallback" => {
+                force_pin_fallback = true;
+                idx += 1;
+            }
             "--pin-stdin" | "--password-stdin" => {
                 return Err("stdin auth flags are only valid for authenticate.".to_string());
             }
@@ -196,7 +205,10 @@ fn parse_preflight_command(args: &[String]) -> Result<Command, String> {
     }
 
     let target_uid = target_uid.ok_or_else(|| "Missing required --uid argument.".to_string())?;
-    Ok(Command::Preflight { target_uid })
+    Ok(Command::Preflight {
+        target_uid,
+        force_pin_fallback,
+    })
 }
 
 fn print_usage() {
@@ -209,7 +221,7 @@ fn print_usage() {
     eprintln!("  mykey-auth logout");
     eprintln!("  mykey-auth status");
     eprintln!("  mykey-auth authenticate --uid <uid> [--pin-stdin|--password-stdin] (internal)");
-    eprintln!("  mykey-auth preflight --uid <uid>                  (internal)");
+    eprintln!("  mykey-auth preflight --uid <uid> [--pin-fallback] (internal)");
 }
 
 async fn run_authenticate(target_uid: u32, input: AuthenticateInput) {
@@ -221,7 +233,7 @@ async fn run_authenticate(target_uid: u32, input: AuthenticateInput) {
         }
     };
 
-    let readiness = auth_readiness_from_client(&client, target_uid).await;
+    let readiness = auth_readiness_from_client(&client, target_uid, false).await;
     let mode = match readiness {
         Ok(AuthReadiness::Ready(mode)) => mode,
         Ok(AuthReadiness::Ignore(msg)) => {
@@ -318,7 +330,7 @@ async fn run_authenticate(target_uid: u32, input: AuthenticateInput) {
     }
 }
 
-async fn run_preflight(target_uid: u32) {
+async fn run_preflight(target_uid: u32, force_pin_fallback: bool) {
     let client = match daemon_client::DaemonClient::connect().await {
         Ok(client) => client,
         Err(e) => {
@@ -327,7 +339,7 @@ async fn run_preflight(target_uid: u32) {
         }
     };
 
-    let readiness = auth_readiness_from_client(&client, target_uid).await;
+    let readiness = auth_readiness_from_client(&client, target_uid, force_pin_fallback).await;
     client.disconnect().await;
 
     match readiness {
@@ -353,6 +365,7 @@ async fn run_preflight(target_uid: u32) {
 async fn auth_readiness_from_client(
     client: &daemon_client::DaemonClient,
     target_uid: u32,
+    force_pin_fallback: bool,
 ) -> Result<AuthReadiness, String> {
     let local_auth = client
         .local_auth_status(target_uid)
@@ -372,6 +385,21 @@ async fn auth_readiness_from_client(
         .pin_status(target_uid)
         .await
         .map_err(|e| format!("Could not read MyKey PIN status: {e}"))?;
+
+    if force_pin_fallback {
+        if !status.is_set {
+            return Ok(AuthReadiness::Ignore(
+                "MyKey PIN fallback is not configured. Run: mykey-pin set".to_string(),
+            ));
+        }
+        if status.cooldown_remaining_secs > 0 {
+            return Ok(AuthReadiness::Locked(format!(
+                "MyKey PIN fallback is locked. Try again in {} seconds.",
+                status.cooldown_remaining_secs
+            )));
+        }
+        return Ok(AuthReadiness::Ready(AuthMode::PinOnly));
+    }
 
     if !status.is_set {
         if local_auth.password_fallback_allowed {
@@ -499,9 +527,22 @@ async fn authenticate_with_pin_fallback(
     if verified {
         Ok(AuthenticateResult::Success)
     } else {
-        Ok(AuthenticateResult::AuthFailed(
-            "Incorrect MyKey PIN.".to_string(),
+        let status = client
+            .pin_status(target_uid)
+            .await
+            .map_err(|e| format!("Could not read MyKey PIN status: {e}"))?;
+        Ok(pin_failure_result(status))
+    }
+}
+
+fn pin_failure_result(status: daemon_client::PinStatus) -> AuthenticateResult {
+    if status.cooldown_remaining_secs > 0 {
+        AuthenticateResult::Locked(format!(
+            "Incorrect MyKey PIN.\nMyKey PIN locked. Try again in {} seconds.",
+            status.cooldown_remaining_secs
         ))
+    } else {
+        AuthenticateResult::AuthFailed("Incorrect MyKey PIN.".to_string())
     }
 }
 
@@ -575,6 +616,7 @@ async fn authenticate_with_biometrics(
     for _ in 0..attempt_limit {
         match biometrics::verify_group_for_login(backends, &system_username).await {
             biometrics::RuntimeBiometricAttemptResult::Success => {
+                client.clear_pin_failures(target_uid).await?;
                 return Ok(AuthenticateResult::Success);
             }
             biometrics::RuntimeBiometricAttemptResult::Failed(message) => {
@@ -625,7 +667,10 @@ async fn authenticate_with_security_key_stage(
     prior_stage_message: Option<String>,
 ) -> Result<AuthenticateResult, String> {
     match security_keys::verify_for_login(target_uid) {
-        security_keys::RuntimeVerificationResult::Success => Ok(AuthenticateResult::Success),
+        security_keys::RuntimeVerificationResult::Success => {
+            client.clear_pin_failures(target_uid).await?;
+            Ok(AuthenticateResult::Success)
+        }
         security_keys::RuntimeVerificationResult::Failed => {
             fallback_to_pin_after_backend_failure(
                 client,
@@ -1633,7 +1678,11 @@ fn read_pin_from_stdin() -> Result<Zeroizing<Vec<u8>>, std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, preflight_mode_label, AuthMode, AuthenticateInput, Command};
+    use super::{
+        parse_args, pin_failure_result, preflight_mode_label, AuthMode, AuthenticateInput,
+        AuthenticateResult, Command,
+    };
+    use crate::daemon_client::PinStatus;
 
     #[test]
     fn parse_authenticate_args_accepts_uid_and_pin_stdin() {
@@ -1731,6 +1780,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_preflight_command() {
+        let args = vec![
+            "mykey-auth".to_string(),
+            "preflight".to_string(),
+            "--uid".to_string(),
+            "1000".to_string(),
+        ];
+
+        let parsed = parse_args(&args).expect("arguments should parse");
+        match parsed {
+            Command::Preflight {
+                target_uid,
+                force_pin_fallback,
+            } => {
+                assert_eq!(target_uid, 1000);
+                assert!(!force_pin_fallback);
+            }
+            _ => panic!("expected preflight command"),
+        }
+    }
+
+    #[test]
+    fn parse_preflight_command_accepts_pin_fallback_flag() {
+        let args = vec![
+            "mykey-auth".to_string(),
+            "preflight".to_string(),
+            "--uid".to_string(),
+            "1000".to_string(),
+            "--pin-fallback".to_string(),
+        ];
+
+        let parsed = parse_args(&args).expect("arguments should parse");
+        match parsed {
+            Command::Preflight {
+                target_uid,
+                force_pin_fallback,
+            } => {
+                assert_eq!(target_uid, 1000);
+                assert!(force_pin_fallback);
+            }
+            _ => panic!("expected preflight command"),
+        }
+    }
+
+    #[test]
     fn preflight_mode_label_describes_runtime_mode() {
         assert_eq!(preflight_mode_label(&AuthMode::PinOnly), "pin");
         assert_eq!(
@@ -1754,6 +1848,32 @@ mod tests {
                 attempt_limit: 3,
             }),
             "biometric-group:fprintd,howdy"
+        );
+    }
+
+    #[test]
+    fn pin_failure_result_stays_plain_before_lockout() {
+        assert_eq!(
+            pin_failure_result(PinStatus {
+                is_set: true,
+                cooldown_remaining_secs: 0,
+                failed_sessions: 2,
+            }),
+            AuthenticateResult::AuthFailed("Incorrect MyKey PIN.".to_string())
+        );
+    }
+
+    #[test]
+    fn pin_failure_result_reports_cooldown_when_failure_triggers_lockout() {
+        assert_eq!(
+            pin_failure_result(PinStatus {
+                is_set: true,
+                cooldown_remaining_secs: 60,
+                failed_sessions: 3,
+            }),
+            AuthenticateResult::Locked(
+                "Incorrect MyKey PIN.\nMyKey PIN locked. Try again in 60 seconds.".to_string()
+            )
         );
     }
 }

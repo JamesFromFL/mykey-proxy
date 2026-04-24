@@ -27,8 +27,10 @@ delivered.
   `~/.config/systemd/user/`.
 - System services should be shipped in `/usr/lib/systemd/system/`, not dropped
   into `/etc/systemd/system/`.
-- Package install should auto-enable and auto-start `mykey-daemon` so the auth
-  setup surface works immediately after installation.
+- Package install should leave `mykey-daemon` active so the auth setup surface
+  works immediately after installation.
+- For Arch, daemon finalization should happen in a post-transaction hook after
+  `sysusers.d` and `tmpfiles.d` have already run.
 - Package install should not auto-enable or auto-start user services.
 - Runtime setup belongs in explicit commands and post-install instructions.
 
@@ -67,7 +69,8 @@ installer into the Arch package itself:
 - `mykey-tray.service`
 - `com.mykey.Daemon.conf`
 - `com.mykey.authenticate.policy`
-- `trusted-binaries.json` if runtime hash verification remains part of MyKey
+- `trusted-binaries.json` generation if runtime hash verification remains part
+  of MyKey
 
 These are also package concerns, but should be represented as package metadata
 or helper files instead of being created imperatively by `install.sh`:
@@ -86,7 +89,13 @@ These actions still matter, but should happen after package install through
 instructions or explicit commands, not during `pacman -S`, except for the
 required daemon bring-up:
 
-- `mykey-daemon` should already be enabled and started by package install
+- `mykey-daemon` should already be active when package install returns
+- on Arch, the post-transaction hook should:
+  - regenerate `/etc/mykey/trusted-binaries.json` from the final installed
+    `/usr/bin/mykey-daemon`
+  - reload systemd state
+  - enable and start `mykey-daemon` on first install
+  - restart `mykey-daemon` on upgrade if the service is already enabled
 - complete auth-first local setup
   - `sudo mykey-auth setup`
   - this should own:
@@ -116,7 +125,8 @@ required daemon bring-up:
   - `journalctl -u mykey-daemon`
 
 If a package-level `.install` file is used, it should print these commands as
-guidance, while still being allowed to bring `mykey-daemon` up automatically.
+guidance, while leaving daemon finalization to the post-transaction hook rather
+than the earlier scriptlet phase.
 
 ## Remove From The Package Path Entirely
 
@@ -176,6 +186,16 @@ complete, shippable package today:
 - The current polkit defaults still need tightening.
   - The package should not be treated as stable while
     `allow_any` / `allow_inactive` / `allow_active` all remain `auth_self`.
+- The package path still needs fresh host validation after the hook-based
+  daemon finalization changes.
+  - the previous host validation uncovered three concrete bugs:
+    - daemon TPM access for the `mykey` service account
+    - trusted-binary hash generation from the pre-package artifact instead of
+      the final installed daemon binary
+    - daemon startup timing that ran too early in `post_install()`
+  - the current repo now addresses those through `SupplementaryGroups=tss` on
+    the daemon service and a post-transaction package hook, but that path
+    still needs a clean host re-test
 - Uninstall and purge are not the same operation yet.
   - Package removal should preserve `/etc/mykey` state by default so secrets
     are not silently destroyed or orphaned.

@@ -82,6 +82,13 @@ Important nuance:
   fallback is actually attempted
 - security-key failures follow the same rule and do not touch the MyKey PIN
   lockout counter unless PIN fallback is actually attempted
+- a successful biometric or security-key login clears stale MyKey PIN failure
+  debt so an old lockout history does not survive a successful MyKey auth
+- once PIN fallback is reached in a PAM conversation, retries stay inside the
+  PIN stage instead of bouncing back to the biometric prompt
+- the lockout-triggering bad PIN now reports the active cooldown immediately,
+  and locked-PIN retries in the same PAM conversation do not restate the same
+  lockout message on every retry
 
 So “biometrics support” now means setup, policy, and a first live
 biometric-first PAM runtime path, not just scaffolding.
@@ -110,6 +117,8 @@ Today that means:
 - only offers security-key and biometric enrollment if PIN fallback exists
 - always enables MyKey-managed base PAM targets
 - then offers opt-in login and unlock takeover
+- if PIN is later reset, any biometric or security-key stages tied to that PIN
+  are disabled and must be reconfigured after a new PIN is set
 
 ### `mykey-auth enable`
 
@@ -160,8 +169,9 @@ Current scaffold:
 
 Current limitations:
 
-- biometric runtime still needs broad host-installed calibration across the
-  supported PAM surfaces MyKey manages
+- initial host-installed validation is now complete for `sudo`, `polkit-1`,
+  and the opt-in `gdm-fingerprint` target, but broader PAM-surface calibration
+  is still open
 - `fprintd` tracking is limited by upstream backend semantics
 
 ## Security-Key Status

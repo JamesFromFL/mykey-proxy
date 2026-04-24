@@ -97,12 +97,32 @@ async fn run_verify(target_uid: u32) {
     };
 
     let result = client.pin_verify(target_uid, pin.as_slice()).await;
-    client.disconnect().await;
 
     match result {
-        Ok(true) => std::process::exit(0),
-        Ok(false) => std::process::exit(1),
+        Ok(true) => {
+            client.disconnect().await;
+            std::process::exit(0);
+        }
+        Ok(false) => {
+            let status = client.pin_status(target_uid).await;
+            client.disconnect().await;
+            match status {
+                Ok(status) if status.cooldown_remaining_secs > 0 => {
+                    eprintln!(
+                        "Incorrect MyKey PIN.\nMyKey PIN locked. Try again in {} seconds.",
+                        status.cooldown_remaining_secs
+                    );
+                    std::process::exit(3);
+                }
+                Ok(_) => std::process::exit(1),
+                Err(e) => {
+                    eprintln!("Could not read MyKey PIN status: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Err(e) => {
+            client.disconnect().await;
             eprintln!("MyKey PIN verification failed: {e}");
             std::process::exit(2);
         }

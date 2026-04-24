@@ -5,7 +5,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 pub const MYKEY_PAM_LINE: &str =
-    "-auth    [success=done ignore=ignore authinfo_unavail=ignore default=bad]    pam_mykey.so";
+    "-auth    [success=done ignore=ignore authinfo_unavail=ignore default=die]    pam_mykey.so";
 
 const MANAGED_BLOCK_START: &str = "# BEGIN MYKEY MANAGED AUTH";
 const MANAGED_BLOCK_END: &str = "# END MYKEY MANAGED AUTH";

@@ -1,18 +1,11 @@
 post_install() {
-  daemon_status_message="  - mykey-daemon was enabled and started successfully."
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    if ! systemctl enable --now mykey-daemon >/dev/null 2>&1; then
-      daemon_status_message="  - mykey-daemon could not be enabled and started automatically. Run: sudo systemctl enable --now mykey-daemon"
-    fi
-  else
-    daemon_status_message="  - systemctl was not available during install. Run: sudo systemctl enable --now mykey-daemon"
-  fi
-
   cat <<EOF
 Installation complete.
 
-${daemon_status_message}
+MyKey's post-transaction hook will now:
+  - refresh /etc/mykey/trusted-binaries.json from the final installed daemon binary
+  - reload systemd state
+  - enable and start mykey-daemon
 
 Recommended next steps:
   1. See the top-level control surface:
@@ -57,24 +50,33 @@ EOF
 }
 
 post_upgrade() {
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload >/dev/null 2>&1 || true
-  fi
-
   cat <<'EOF'
 MyKey was upgraded.
+
+MyKey's post-transaction hook will now:
+  - refresh the trusted daemon hash manifest
+  - reload systemd state
+  - restart mykey-daemon if it is currently enabled
 
 Recommended next steps:
   - Review the current control surface:
     mykey --help
-  - If needed, restart the daemon:
-    sudo systemctl restart mykey-daemon
   - Re-run auth setup only if you intentionally want to change your MyKey auth configuration:
     sudo mykey-auth setup
 EOF
 }
 
+pre_remove() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now mykey-daemon >/dev/null 2>&1 || true
+  fi
+}
+
 post_remove() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+
   cat <<'EOF'
 MyKey package files were removed.
 
