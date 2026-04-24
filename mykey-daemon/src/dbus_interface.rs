@@ -22,10 +22,12 @@ use zeroize::Zeroizing;
 
 use crate::authentication;
 use crate::crypto;
+use crate::elevated_auth::{ElevatedAuthStore, ElevatedPurpose};
 use crate::local_auth_policy::{
-    BiometricBackend, LocalAuthMethod, LocalAuthPolicy, LocalAuthPolicyStore,
+    BiometricBackend, LocalAuthPolicy, LocalAuthPolicyStore,
 };
 use crate::pam;
+use crate::password_fallback::PasswordFallbackStore;
 use crate::pin_store::PinStore;
 use crate::protocol::{CreateRequest, GetRequest};
 use crate::registration;
@@ -43,6 +45,8 @@ pub struct DaemonState {
     pub sessions: SessionStore,
     pub replay_cache: AsyncReplayCache,
     pub pin_store: PinStore,
+    pub elevated_auth_store: ElevatedAuthStore,
+    pub password_fallback_store: PasswordFallbackStore,
     pub local_auth_policy_store: LocalAuthPolicyStore,
 }
 
@@ -52,6 +56,8 @@ impl DaemonState {
             sessions: SessionStore::new(),
             replay_cache: AsyncReplayCache::new(),
             pin_store: PinStore::default(),
+            elevated_auth_store: ElevatedAuthStore::default(),
+            password_fallback_store: PasswordFallbackStore::default(),
             local_auth_policy_store: LocalAuthPolicyStore::default(),
         }
     }
@@ -343,22 +349,129 @@ impl DaemonInterface {
     /// Return local-auth policy state for `target_uid`.
     ///
     /// Tuple layout:
-    ///   `(enabled, primary_method, pin_fallback_enabled, biometric_backend)`
+    ///   `(enabled, auth_chain, biometric_backends, password_fallback_allowed,
+    ///     elevated_password_required, biometric_attempt_limit)`
     async fn local_auth_status(
         &self,
         pid: u32,
         target_uid: u32,
         #[zbus(connection)] conn: &Connection,
         #[zbus(header)] header: Header<'_>,
-    ) -> Result<(bool, String, bool, String), zbus::fdo::Error> {
+    ) -> Result<(bool, Vec<String>, Vec<String>, bool, bool, u8), zbus::fdo::Error> {
         let _identity = self
             .authorize_pin_call(conn, &header, pid, target_uid)
             .await?;
         self.local_auth_status_for_uid(target_uid)
     }
 
+    // ── ElevatedAuthStatus ──────────────────────────────────────────────────
+    /// Return password-rate-limit state for elevated MyKey actions.
+    ///
+    /// Tuple layout:
+    ///   `(retry_after_secs, failed_attempts)`
+    async fn password_fallback_status(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(u64, u32), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_password_fallback_call(conn, &header, pid, target_uid)
+            .await?;
+        self.password_fallback_status_for_uid(target_uid)
+    }
+
+    /// Record a failed password attempt for normal MyKey-managed password fallback.
+    ///
+    /// Tuple layout:
+    ///   `(retry_after_secs, failed_attempts)`
+    async fn record_password_fallback_failure(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(u64, u32), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_password_fallback_call(conn, &header, pid, target_uid)
+            .await?;
+        self.record_password_fallback_failure_for_uid(target_uid)
+    }
+
+    /// Clear daemon-owned rate-limit state after successful MyKey-managed password fallback.
+    async fn clear_password_fallback_failures(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_password_fallback_call(conn, &header, pid, target_uid)
+            .await?;
+        self.clear_password_fallback_failures_for_uid(target_uid)
+    }
+
+    /// Return password-rate-limit state for elevated MyKey actions.
+    ///
+    /// Tuple layout:
+    ///   `(retry_after_secs, failed_attempts)`
+    async fn elevated_auth_status(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(u64, u32), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_elevated_auth_query_call(conn, &header, pid, target_uid)
+            .await?;
+        self.elevated_auth_status_for_uid(target_uid)
+    }
+
+    // ── RecordElevatedAuthFailure ───────────────────────────────────────────
+    /// Record a failed password attempt for an elevated MyKey action.
+    ///
+    /// Tuple layout:
+    ///   `(retry_after_secs, failed_attempts)`
+    async fn record_elevated_auth_failure(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(u64, u32), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_elevated_auth_grant_call(conn, &header, pid, target_uid)
+            .await?;
+        self.record_elevated_auth_failure_for_uid(target_uid)
+    }
+
+    // ── GrantElevatedAuth ───────────────────────────────────────────────────
+    /// Grant a short-lived elevated-auth capability for `target_uid`.
+    ///
+    /// `purpose` must be one of:
+    ///   - `pin_enroll`
+    ///   - `pin_reset`
+    ///   - `biometric_manage`
+    ///   - `security_key_manage`
+    async fn grant_elevated_auth(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        purpose: String,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_elevated_auth_grant_call(conn, &header, pid, target_uid)
+            .await?;
+        self.grant_elevated_auth_for_uid(target_uid, purpose.as_str())
+    }
+
     // ── EnableBiometricBackend ───────────────────────────────────────────────
-    /// Enable biometric-first local auth for `target_uid` with `backend`.
+    /// Add `backend` to the active biometric stage for `target_uid`.
     ///
     /// This keeps MyKey PIN fallback enabled and enforces that a MyKey PIN is
     /// already configured before biometric policy can be written.
@@ -376,8 +489,28 @@ impl DaemonInterface {
         self.enable_biometric_backend_for_uid(target_uid, backend.as_str())
     }
 
+    // ── SetBiometricBackends ────────────────────────────────────────────────
+    /// Replace the active biometric provider set for `target_uid`.
+    ///
+    /// This is the atomic stage-management method used by `mykey-auth
+    /// biometrics` so multi-provider enroll and provider removal can update the
+    /// full biometric stage with a single elevated grant.
+    async fn set_biometric_backends(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        backends: Vec<String>,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_pin_call(conn, &header, pid, target_uid)
+            .await?;
+        self.set_biometric_backends_for_uid(target_uid, &backends)
+    }
+
     // ── DisableBiometricBackend ──────────────────────────────────────────────
-    /// Remove biometric-first local auth for `target_uid`.
+    /// Clear the biometric stage for `target_uid`.
     ///
     /// If a MyKey PIN is still configured, local auth falls back to PIN-only.
     /// Otherwise the local-auth policy is cleared.
@@ -392,6 +525,42 @@ impl DaemonInterface {
             .authorize_pin_call(conn, &header, pid, target_uid)
             .await?;
         self.disable_biometric_backend_for_uid(target_uid)
+    }
+
+    // ── EnableSecurityKeyAuth ───────────────────────────────────────────────
+    /// Enable security-key-first local auth for `target_uid`.
+    ///
+    /// This keeps MyKey PIN fallback enabled and enforces that a MyKey PIN is
+    /// already configured before security-key policy can be written.
+    async fn enable_security_key_auth(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_pin_call(conn, &header, pid, target_uid)
+            .await?;
+        self.enable_security_key_auth_for_uid(target_uid)
+    }
+
+    // ── DisableSecurityKeyAuth ──────────────────────────────────────────────
+    /// Remove security-key-first local auth for `target_uid`.
+    ///
+    /// If a MyKey PIN is still configured, local auth falls back to PIN-only.
+    /// Otherwise the local-auth policy is cleared.
+    async fn disable_security_key_auth(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), zbus::fdo::Error> {
+        let _identity = self
+            .authorize_pin_call(conn, &header, pid, target_uid)
+            .await?;
+        self.disable_security_key_auth_for_uid(target_uid)
     }
 
     // ── PinEnroll ────────────────────────────────────────────────────────────
@@ -586,12 +755,55 @@ impl DaemonInterface {
         Ok(identity)
     }
 
+    async fn authorize_elevated_auth_query_call(
+        &self,
+        conn: &Connection,
+        header: &Header<'_>,
+        pid: u32,
+        target_uid: u32,
+    ) -> Result<CallerIdentity, zbus::fdo::Error> {
+        let identity = self.authorize_call(conn, header, pid).await?;
+        self.ensure_session(pid).await?;
+        self.ensure_elevated_auth_query_caller(&identity)?;
+        self.ensure_target_uid_access(&identity, target_uid)?;
+        Ok(identity)
+    }
+
+    async fn authorize_password_fallback_call(
+        &self,
+        conn: &Connection,
+        header: &Header<'_>,
+        pid: u32,
+        target_uid: u32,
+    ) -> Result<CallerIdentity, zbus::fdo::Error> {
+        let identity = self.authorize_call(conn, header, pid).await?;
+        self.ensure_session(pid).await?;
+        self.ensure_password_fallback_caller(&identity)?;
+        self.ensure_target_uid_access(&identity, target_uid)?;
+        Ok(identity)
+    }
+
+    async fn authorize_elevated_auth_grant_call(
+        &self,
+        conn: &Connection,
+        header: &Header<'_>,
+        pid: u32,
+        target_uid: u32,
+    ) -> Result<CallerIdentity, zbus::fdo::Error> {
+        let identity = self.authorize_call(conn, header, pid).await?;
+        self.ensure_session(pid).await?;
+        self.ensure_elevated_auth_grant_caller(&identity)?;
+        self.ensure_target_uid_access(&identity, target_uid)?;
+        Ok(identity)
+    }
+
     fn ensure_pin_api_caller(&self, identity: &CallerIdentity) -> Result<(), zbus::fdo::Error> {
         match identity.mykey_program {
             Some("mykey-pin")
             | Some("mykey-pin-auth")
             | Some("mykey-manager")
-            | Some("mykey-auth") => Ok(()),
+            | Some("mykey-auth")
+            | Some("mykey-security-key") => Ok(()),
             Some(other) => Err(zbus::fdo::Error::AccessDenied(format!(
                 "PIN APIs are not available to {other}"
             ))),
@@ -613,6 +825,54 @@ impl DaemonInterface {
             None => Err(zbus::fdo::Error::AccessDenied(
                 "User-presence confirmation is only available to trusted MyKey frontends"
                     .to_string(),
+            )),
+        }
+    }
+
+    fn ensure_elevated_auth_query_caller(
+        &self,
+        identity: &CallerIdentity,
+    ) -> Result<(), zbus::fdo::Error> {
+        match identity.mykey_program {
+            Some("mykey-pin")
+            | Some("mykey-auth")
+            | Some("mykey-manager")
+            | Some("mykey-elevated-auth") => Ok(()),
+            Some(other) => Err(zbus::fdo::Error::AccessDenied(format!(
+                "Elevated auth state is not available to {other}"
+            ))),
+            None => Err(zbus::fdo::Error::AccessDenied(
+                "Elevated auth state is only available to trusted MyKey frontends".to_string(),
+            )),
+        }
+    }
+
+    fn ensure_elevated_auth_grant_caller(
+        &self,
+        identity: &CallerIdentity,
+    ) -> Result<(), zbus::fdo::Error> {
+        match identity.mykey_program {
+            Some("mykey-elevated-auth") => Ok(()),
+            Some(other) => Err(zbus::fdo::Error::AccessDenied(format!(
+                "Elevated auth grants are not available to {other}"
+            ))),
+            None => Err(zbus::fdo::Error::AccessDenied(
+                "Elevated auth grants are only available to the dedicated MyKey helper".to_string(),
+            )),
+        }
+    }
+
+    fn ensure_password_fallback_caller(
+        &self,
+        identity: &CallerIdentity,
+    ) -> Result<(), zbus::fdo::Error> {
+        match identity.mykey_program {
+            Some("mykey-auth") | Some("mykey-manager") => Ok(()),
+            Some(other) => Err(zbus::fdo::Error::AccessDenied(format!(
+                "Password fallback state is not available to {other}"
+            ))),
+            None => Err(zbus::fdo::Error::AccessDenied(
+                "Password fallback state is only available to trusted MyKey frontends".to_string(),
             )),
         }
     }
@@ -673,6 +933,7 @@ impl DaemonInterface {
     }
 
     fn pin_enroll_for_uid(&self, uid: u32, pin: Vec<u8>) -> Result<(), zbus::fdo::Error> {
+        self.require_elevated_auth(uid, ElevatedPurpose::PinEnroll)?;
         if self
             .state
             .pin_store
@@ -785,6 +1046,7 @@ impl DaemonInterface {
     }
 
     fn pin_reset_for_uid(&self, uid: u32) -> Result<(), zbus::fdo::Error> {
+        self.require_elevated_auth(uid, ElevatedPurpose::PinReset)?;
         self.state
             .pin_store
             .clear_pin(uid)
@@ -801,60 +1063,208 @@ impl DaemonInterface {
     fn local_auth_status_for_uid(
         &self,
         uid: u32,
-    ) -> Result<(bool, String, bool, String), zbus::fdo::Error> {
-        let mut policy = self
+    ) -> Result<(bool, Vec<String>, Vec<String>, bool, bool, u8), zbus::fdo::Error> {
+        let pin_is_set = self
+            .state
+            .pin_store
+            .pin_is_set(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN status failed: {e}")))?;
+
+        let policy = self
             .state
             .local_auth_policy_store
-            .repair_policy(uid)
+            .sync_effective_policy(uid, pin_is_set)
             .map_err(|e| zbus::fdo::Error::Failed(format!("Local auth policy read failed: {e}")))?;
 
-        // Backfill existing pin-only deployments that predate daemon-owned
-        // local-auth policy. If a PIN exists and no explicit policy has been
-        // written yet, treat that as enabled pin-only local auth and persist it.
-        if !policy.enabled
-            && policy.primary_method == LocalAuthMethod::Pin
-            && !policy.pin_fallback_enabled
-            && policy.biometric_backend.is_none()
-            && self
-                .state
-                .pin_store
-                .pin_is_set(uid)
-                .map_err(|e| zbus::fdo::Error::Failed(format!("PIN status failed: {e}")))?
-        {
-            self.state
-                .local_auth_policy_store
-                .enable_pin_only(uid)
-                .map_err(|e| {
-                    zbus::fdo::Error::Failed(format!("Local auth policy backfill failed: {e}"))
-                })?;
-            policy = self
-                .state
-                .local_auth_policy_store
-                .repair_policy(uid)
-                .map_err(|e| {
-                    zbus::fdo::Error::Failed(format!(
-                        "Local auth policy read failed after backfill: {e}"
-                    ))
-                })?;
-        }
-
-        let biometric_backend = policy
-            .biometric_backend
+        let auth_chain = policy
+            .auth_chain
+            .iter()
+            .map(|stage| stage.as_str().to_string())
+            .collect();
+        let biometric_backends = policy
+            .biometric_backends
+            .iter()
             .map(|backend| backend.as_str().to_string())
-            .unwrap_or_default();
+            .collect();
         Ok((
             policy.enabled,
-            policy.primary_method.as_str().to_string(),
-            policy.pin_fallback_enabled,
-            biometric_backend,
+            auth_chain,
+            biometric_backends,
+            policy.password_fallback_allowed,
+            policy.elevated_password_required,
+            policy.biometric_attempt_limit,
         ))
     }
 
-    fn enable_biometric_backend_for_uid(
+    fn elevated_auth_status_for_uid(&self, uid: u32) -> Result<(u64, u32), zbus::fdo::Error> {
+        let status = self.state.elevated_auth_store.status(uid).map_err(|e| {
+            zbus::fdo::Error::Failed(format!("Elevated auth status read failed: {e}"))
+        })?;
+        Ok((status.retry_after_secs, status.failed_attempts))
+    }
+
+    fn password_fallback_status_for_uid(&self, uid: u32) -> Result<(u64, u32), zbus::fdo::Error> {
+        let status = self
+            .state
+            .password_fallback_store
+            .status(uid)
+            .map_err(|e| {
+                zbus::fdo::Error::Failed(format!("Password fallback status read failed: {e}"))
+            })?;
+        Ok((status.retry_after_secs, status.failed_attempts))
+    }
+
+    fn record_password_fallback_failure_for_uid(
         &self,
         uid: u32,
-        backend: &str,
+    ) -> Result<(u64, u32), zbus::fdo::Error> {
+        let status = self
+            .state
+            .password_fallback_store
+            .record_failure(uid)
+            .map_err(|e| {
+                zbus::fdo::Error::Failed(format!("Password fallback failure write failed: {e}"))
+            })?;
+        Ok((status.retry_after_secs, status.failed_attempts))
+    }
+
+    fn clear_password_fallback_failures_for_uid(&self, uid: u32) -> Result<(), zbus::fdo::Error> {
+        self.state
+            .password_fallback_store
+            .clear_failures(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Password fallback reset failed: {e}")))
+    }
+
+    fn record_elevated_auth_failure_for_uid(
+        &self,
+        uid: u32,
+    ) -> Result<(u64, u32), zbus::fdo::Error> {
+        let status = self
+            .state
+            .elevated_auth_store
+            .record_failure(uid)
+            .map_err(|e| {
+                zbus::fdo::Error::Failed(format!("Elevated auth failure write failed: {e}"))
+            })?;
+        Ok((status.retry_after_secs, status.failed_attempts))
+    }
+
+    fn grant_elevated_auth_for_uid(&self, uid: u32, purpose: &str) -> Result<(), zbus::fdo::Error> {
+        let purpose = ElevatedPurpose::from_str(purpose).ok_or_else(|| {
+            zbus::fdo::Error::InvalidArgs(format!("Unsupported elevated auth purpose: {purpose}"))
+        })?;
+        self.state
+            .elevated_auth_store
+            .grant(uid, purpose)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Elevated auth grant failed: {e}")))
+    }
+
+    fn require_elevated_auth(
+        &self,
+        uid: u32,
+        purpose: ElevatedPurpose,
     ) -> Result<(), zbus::fdo::Error> {
+        let consumed = self
+            .state
+            .elevated_auth_store
+            .consume_grant(uid, purpose)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Elevated auth check failed: {e}")))?;
+        if consumed {
+            Ok(())
+        } else {
+            Err(zbus::fdo::Error::AccessDenied(format!(
+                "Elevated password verification is required before {}",
+                purpose.as_str()
+            )))
+        }
+    }
+
+    fn enable_biometric_backend_for_uid(&self, uid: u32, backend: &str) -> Result<(), zbus::fdo::Error> {
+        let biometric_backend = Self::parse_biometric_backend(backend)?;
+        let mut current_backends = self
+            .state
+            .local_auth_policy_store
+            .sync_effective_policy(
+                uid,
+                self.state
+                    .pin_store
+                    .pin_is_set(uid)
+                    .map_err(|e| zbus::fdo::Error::Failed(format!("PIN status failed: {e}")))?,
+            )
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Local auth policy read failed: {e}")))?
+            .biometric_backends;
+        current_backends.push(biometric_backend);
+        self.write_biometric_backends_for_uid(uid, current_backends)
+    }
+
+    fn set_biometric_backends_for_uid(
+        &self,
+        uid: u32,
+        backends: &[String],
+    ) -> Result<(), zbus::fdo::Error> {
+        let parsed = backends
+            .iter()
+            .map(|backend| Self::parse_biometric_backend(backend))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.write_biometric_backends_for_uid(uid, parsed)
+    }
+
+    fn disable_biometric_backend_for_uid(&self, uid: u32) -> Result<(), zbus::fdo::Error> {
+        self.write_biometric_backends_for_uid(uid, Vec::new())
+    }
+
+    fn write_biometric_backends_for_uid(
+        &self,
+        uid: u32,
+        backends: Vec<BiometricBackend>,
+    ) -> Result<(), zbus::fdo::Error> {
+        self.require_elevated_auth(uid, ElevatedPurpose::BiometricManage)?;
+        let pin_is_set = self
+            .state
+            .pin_store
+            .pin_is_set(uid)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN status failed: {e}")))?;
+        if pin_is_set {
+            let current = self
+                .state
+                .local_auth_policy_store
+                .sync_effective_policy(uid, true)
+                .map_err(|e| {
+                    zbus::fdo::Error::Failed(format!("Local auth policy read failed: {e}"))
+                })?;
+            let mut policy = current.as_persisted_policy();
+            policy.enabled = true;
+            policy.pin_fallback_enabled = true;
+            policy.biometric_backends = backends;
+            self.state
+                .local_auth_policy_store
+                .write_policy(uid, &policy)
+                .map_err(|e| {
+                    zbus::fdo::Error::Failed(format!("Local auth policy update failed: {e}"))
+                })?;
+        } else {
+            self.state
+                .local_auth_policy_store
+                .clear_policy(uid)
+                .map_err(|e| {
+                    zbus::fdo::Error::Failed(format!("Local auth policy clear failed: {e}"))
+                })?;
+        }
+        Ok(())
+    }
+
+    fn parse_biometric_backend(backend: &str) -> Result<BiometricBackend, zbus::fdo::Error> {
+        match backend {
+            "fprintd" => Ok(BiometricBackend::Fprintd),
+            "howdy" => Ok(BiometricBackend::Howdy),
+            other => Err(zbus::fdo::Error::InvalidArgs(format!(
+                "Unsupported biometric backend: {other}"
+            ))),
+        }
+    }
+
+    fn enable_security_key_auth_for_uid(&self, uid: u32) -> Result<(), zbus::fdo::Error> {
+        self.require_elevated_auth(uid, ElevatedPurpose::SecurityKeyManage)?;
         if !self
             .state
             .pin_store
@@ -862,42 +1272,53 @@ impl DaemonInterface {
             .map_err(|e| zbus::fdo::Error::Failed(format!("PIN status failed: {e}")))?
         {
             return Err(zbus::fdo::Error::Failed(format!(
-                "A MyKey PIN must be configured before biometrics can be enabled for uid={uid}"
+                "A MyKey PIN must be configured before security-key auth can be enabled for uid={uid}"
             )));
         }
 
-        let biometric_backend = match backend {
-            "fprintd" => BiometricBackend::Fprintd,
-            "howdy" => BiometricBackend::Howdy,
-            other => {
-                return Err(zbus::fdo::Error::InvalidArgs(format!(
-                    "Unsupported biometric backend: {other}"
-                )))
-            }
-        };
-
-        let policy = LocalAuthPolicy {
-            enabled: true,
-            primary_method: LocalAuthMethod::Biometric,
-            pin_fallback_enabled: true,
-            biometric_backend: Some(biometric_backend),
-        };
+        let current = self
+            .state
+            .local_auth_policy_store
+            .sync_effective_policy(uid, true)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Local auth policy read failed: {e}")))?;
+        let mut policy = current.as_persisted_policy();
+        policy.enabled = true;
+        policy.pin_fallback_enabled = true;
+        policy.security_key_enabled = true;
         self.state
             .local_auth_policy_store
             .write_policy(uid, &policy)
             .map_err(|e| zbus::fdo::Error::Failed(format!("Local auth policy update failed: {e}")))
     }
 
-    fn disable_biometric_backend_for_uid(&self, uid: u32) -> Result<(), zbus::fdo::Error> {
-        if self
+    fn disable_security_key_auth_for_uid(&self, uid: u32) -> Result<(), zbus::fdo::Error> {
+        self.require_elevated_auth(uid, ElevatedPurpose::SecurityKeyManage)?;
+        let pin_is_set = self
             .state
             .pin_store
             .pin_is_set(uid)
-            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN status failed: {e}")))?
-        {
+            .map_err(|e| zbus::fdo::Error::Failed(format!("PIN status failed: {e}")))?;
+        if pin_is_set {
+            let current = self
+                .state
+                .local_auth_policy_store
+                .sync_effective_policy(uid, true)
+                .map_err(|e| {
+                    zbus::fdo::Error::Failed(format!("Local auth policy read failed: {e}"))
+                })?;
+            let mut policy = current.as_persisted_policy();
+            policy.security_key_enabled = false;
+            if policy.biometric_backends.is_empty() {
+                policy = LocalAuthPolicy {
+                    enabled: true,
+                    pin_fallback_enabled: true,
+                    biometric_backends: Vec::new(),
+                    security_key_enabled: false,
+                };
+            }
             self.state
                 .local_auth_policy_store
-                .enable_pin_only(uid)
+                .write_policy(uid, &policy)
                 .map_err(|e| {
                     zbus::fdo::Error::Failed(format!("Local auth policy update failed: {e}"))
                 })?;
@@ -1010,6 +1431,12 @@ mod tests {
             sessions: SessionStore::new(),
             replay_cache: AsyncReplayCache::new(),
             pin_store: PinStore::new(unique_test_root("mykey-dbus-pin-test")),
+            elevated_auth_store: ElevatedAuthStore::new(unique_test_root(
+                "mykey-dbus-elevated-auth-test",
+            )),
+            password_fallback_store: PasswordFallbackStore::new(unique_test_root(
+                "mykey-dbus-password-fallback-test",
+            )),
             local_auth_policy_store: LocalAuthPolicyStore::new(unique_test_root(
                 "mykey-dbus-local-auth-test",
             )),
@@ -1083,6 +1510,58 @@ mod tests {
     }
 
     #[test]
+    fn elevated_auth_queries_allow_frontends_and_helper() {
+        let interface = test_interface();
+
+        assert!(interface
+            .ensure_elevated_auth_query_caller(&identity(1000, Some("mykey-pin")))
+            .is_ok());
+        assert!(interface
+            .ensure_elevated_auth_query_caller(&identity(1000, Some("mykey-auth")))
+            .is_ok());
+        assert!(interface
+            .ensure_elevated_auth_query_caller(&identity(1000, Some("mykey-manager")))
+            .is_ok());
+        assert!(interface
+            .ensure_elevated_auth_query_caller(&identity(1000, Some("mykey-elevated-auth")))
+            .is_ok());
+        assert!(interface
+            .ensure_elevated_auth_query_caller(&identity(1000, Some("mykey-migrate")))
+            .is_err());
+    }
+
+    #[test]
+    fn password_fallback_queries_only_allow_runtime_frontends() {
+        let interface = test_interface();
+
+        assert!(interface
+            .ensure_password_fallback_caller(&identity(1000, Some("mykey-auth")))
+            .is_ok());
+        assert!(interface
+            .ensure_password_fallback_caller(&identity(1000, Some("mykey-manager")))
+            .is_ok());
+
+        assert!(interface
+            .ensure_password_fallback_caller(&identity(1000, Some("mykey-pin")))
+            .is_err());
+        assert!(interface
+            .ensure_password_fallback_caller(&identity(1000, Some("mykey-elevated-auth")))
+            .is_err());
+    }
+
+    #[test]
+    fn elevated_auth_grants_only_allow_dedicated_helper() {
+        let interface = test_interface();
+
+        assert!(interface
+            .ensure_elevated_auth_grant_caller(&identity(0, Some("mykey-elevated-auth")))
+            .is_ok());
+        assert!(interface
+            .ensure_elevated_auth_grant_caller(&identity(1000, Some("mykey-pin")))
+            .is_err());
+    }
+
+    #[test]
     fn pin_policy_accepts_only_numeric_values_in_range() {
         assert!(DaemonInterface::validate_new_pin(b"1234").is_ok());
         assert!(DaemonInterface::validate_new_pin(b"123456789012").is_ok());
@@ -1106,7 +1585,17 @@ mod tests {
             .local_auth_status_for_uid(1000)
             .expect("read local auth status");
 
-        assert_eq!(status, (true, "pin".to_string(), true, String::new()));
+        assert_eq!(
+            status,
+            (
+                true,
+                vec!["pin".to_string()],
+                Vec::new(),
+                false,
+                true,
+                0
+            )
+        );
     }
 
     #[test]
@@ -1133,6 +1622,239 @@ mod tests {
             .local_auth_status_for_uid(1000)
             .expect("read local auth status");
 
-        assert_eq!(status, (false, "pin".to_string(), false, String::new()));
+        assert_eq!(
+            status,
+            (false, Vec::new(), Vec::new(), true, true, 0)
+        );
+    }
+
+    #[test]
+    fn enable_security_key_auth_adds_security_key_stage() {
+        let interface = test_interface();
+        interface
+            .state
+            .pin_store
+            .write_pin_blob(1000, b"dummy-sealed-pin")
+            .expect("write dummy pin blob");
+        interface
+            .state
+            .elevated_auth_store
+            .grant(1000, ElevatedPurpose::SecurityKeyManage)
+            .expect("grant elevated auth");
+
+        interface
+            .enable_security_key_auth_for_uid(1000)
+            .expect("enable security-key auth");
+
+        let status = interface
+            .local_auth_status_for_uid(1000)
+            .expect("read local auth status");
+        assert_eq!(
+            status,
+            (
+                true,
+                vec!["security_key".to_string(), "pin".to_string()],
+                Vec::new(),
+                false,
+                true,
+                0
+            )
+        );
+    }
+
+    #[test]
+    fn disable_security_key_auth_falls_back_to_pin_only() {
+        let interface = test_interface();
+        interface
+            .state
+            .pin_store
+            .write_pin_blob(1000, b"dummy-sealed-pin")
+            .expect("write dummy pin blob");
+        interface
+            .state
+            .local_auth_policy_store
+            .write_policy(
+                1000,
+                &LocalAuthPolicy {
+                    enabled: true,
+                    pin_fallback_enabled: true,
+                    biometric_backends: Vec::new(),
+                    security_key_enabled: true,
+                },
+            )
+            .expect("write security-key policy");
+        interface
+            .state
+            .elevated_auth_store
+            .grant(1000, ElevatedPurpose::SecurityKeyManage)
+            .expect("grant elevated auth");
+
+        interface
+            .disable_security_key_auth_for_uid(1000)
+            .expect("disable security-key auth");
+
+        let status = interface
+            .local_auth_status_for_uid(1000)
+            .expect("read local auth status");
+        assert_eq!(
+            status,
+            (
+                true,
+                vec!["pin".to_string()],
+                Vec::new(),
+                false,
+                true,
+                0
+            )
+        );
+    }
+
+    #[test]
+    fn enable_security_key_auth_preserves_existing_biometric_stage() {
+        let interface = test_interface();
+        interface
+            .state
+            .pin_store
+            .write_pin_blob(1000, b"dummy-sealed-pin")
+            .expect("write dummy pin blob");
+        interface
+            .state
+            .local_auth_policy_store
+            .write_policy(
+                1000,
+                &LocalAuthPolicy {
+                    enabled: true,
+                    pin_fallback_enabled: true,
+                    biometric_backends: vec![BiometricBackend::Fprintd],
+                    security_key_enabled: false,
+                },
+            )
+            .expect("write biometric policy");
+        interface
+            .state
+            .elevated_auth_store
+            .grant(1000, ElevatedPurpose::SecurityKeyManage)
+            .expect("grant elevated auth");
+
+        interface
+            .enable_security_key_auth_for_uid(1000)
+            .expect("enable security-key auth");
+
+        let status = interface
+            .local_auth_status_for_uid(1000)
+            .expect("read local auth status");
+        assert_eq!(
+            status,
+            (
+                true,
+                vec![
+                    "biometric".to_string(),
+                    "security_key".to_string(),
+                    "pin".to_string()
+                ],
+                vec!["fprintd".to_string()],
+                false,
+                true,
+                3
+            )
+        );
+    }
+
+    #[test]
+    fn enable_biometric_backend_adds_to_existing_biometric_stage() {
+        let interface = test_interface();
+        interface
+            .state
+            .pin_store
+            .write_pin_blob(1000, b"dummy-sealed-pin")
+            .expect("write dummy pin blob");
+        interface
+            .state
+            .local_auth_policy_store
+            .write_policy(
+                1000,
+                &LocalAuthPolicy {
+                    enabled: true,
+                    pin_fallback_enabled: true,
+                    biometric_backends: vec![BiometricBackend::Fprintd],
+                    security_key_enabled: false,
+                },
+            )
+            .expect("write biometric policy");
+        interface
+            .state
+            .elevated_auth_store
+            .grant(1000, ElevatedPurpose::BiometricManage)
+            .expect("grant elevated auth");
+
+        interface
+            .enable_biometric_backend_for_uid(1000, "howdy")
+            .expect("enable second biometric backend");
+
+        let status = interface
+            .local_auth_status_for_uid(1000)
+            .expect("read local auth status");
+        assert_eq!(
+            status,
+            (
+                true,
+                vec!["biometric".to_string(), "pin".to_string()],
+                vec!["fprintd".to_string(), "howdy".to_string()],
+                false,
+                true,
+                3
+            )
+        );
+    }
+
+    #[test]
+    fn set_biometric_backends_preserves_security_key_stage() {
+        let interface = test_interface();
+        interface
+            .state
+            .pin_store
+            .write_pin_blob(1000, b"dummy-sealed-pin")
+            .expect("write dummy pin blob");
+        interface
+            .state
+            .local_auth_policy_store
+            .write_policy(
+                1000,
+                &LocalAuthPolicy {
+                    enabled: true,
+                    pin_fallback_enabled: true,
+                    biometric_backends: vec![BiometricBackend::Fprintd],
+                    security_key_enabled: true,
+                },
+            )
+            .expect("write mixed auth policy");
+        interface
+            .state
+            .elevated_auth_store
+            .grant(1000, ElevatedPurpose::BiometricManage)
+            .expect("grant elevated auth");
+
+        interface
+            .set_biometric_backends_for_uid(1000, &["howdy".to_string()])
+            .expect("replace biometric backend set");
+
+        let status = interface
+            .local_auth_status_for_uid(1000)
+            .expect("read local auth status");
+        assert_eq!(
+            status,
+            (
+                true,
+                vec![
+                    "biometric".to_string(),
+                    "security_key".to_string(),
+                    "pin".to_string()
+                ],
+                vec!["howdy".to_string()],
+                false,
+                true,
+                3
+            )
+        );
     }
 }

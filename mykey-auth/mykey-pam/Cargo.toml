@@ -9,13 +9,17 @@ license = "MIT"
 name = "mykey-auth"
 path = "src/bin/mykey-auth.rs"
 
+[[bin]]
+name = "mykey-elevated-auth"
+path = "src/bin/mykey-elevated-auth.rs"
+
 [lib]
 name = "pam_mykey"
 crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-pam = { version = "0.8", features = ["module"] }
+pam = { version = "0.8", features = ["client", "module"] }
 zbus = { version = "4", features = ["tokio"] }
 tokio = { version = "1", features = ["full"] }
 zeroize = { version = "1", features = ["derive"] }
@@ -25,3 +29,4 @@ libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = true, features = ["clock", "serde"] }
+rpassword = "7"

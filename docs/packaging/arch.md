@@ -18,6 +18,7 @@ The package should own:
 
 - binaries
 - PAM modules
+- dedicated PAM service definitions
 - unit files
 - D-Bus policy
 - polkit actions
@@ -27,22 +28,53 @@ The package should not own:
 
 - provider migration logic
 - auth enrollment
-- service autostart as a side effect of installation
 - destructive uninstall cleanup of user state
+
+The one service-side exception is `mykey-daemon`:
+
+- installation should enable and start `mykey-daemon` before the operator runs
+  any auth setup commands
+- user-session services such as `mykey-secrets` and `mykey-tray` should still
+  remain explicit user actions
 
 ## Post-Install Setup
 
 The intended post-install setup path is:
 
 ```bash
-sudo systemctl enable --now mykey-daemon
-mykey-migrate --enroll
-mykey-pin set
-sudo mykey-auth enable
-mykey-tray enable   # optional
+mykey --help
+sudo mykey-auth setup
+mykey-migrate --enroll    # optional; only when you want MyKey to own Secret Service
+mykey tray enable         # optional
 ```
 
-`mykey-auth login` remains a separate opt-in step for login and unlock targets.
+The intended ordering is:
+
+- package install should already leave `mykey-daemon` active
+- auth-first setup comes before optional Secret Service takeover
+- `mykey-migrate --enroll` is not part of the minimum local-auth bring-up path
+- `mykey-secrets` should not be enabled manually before `mykey-migrate --enroll`
+
+`mykey-auth setup` now owns the operator-facing auth bring-up order:
+
+- PIN first
+- optional security key
+- optional biometrics
+- required base PAM takeover
+- optional login/unlock takeover
+
+The package payload also needs to carry the dedicated elevated-management auth
+surface, including `mykey-elevated-auth` and `/etc/pam.d/mykey-elevated-auth`,
+so MyKey does not depend on a broad shared PAM stack for setup and reset work.
+
+The current package payload also includes:
+
+- `mykey-security-key`
+- `mykey-security-key-auth`
+- `/etc/pam.d/mykey-security-key-auth`
+
+`pam-u2f` should stay an optional dependency because security-key management is
+optional even though the package ships the dedicated PAM service.
 
 ## Current Blockers
 

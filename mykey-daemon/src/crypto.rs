@@ -9,16 +9,11 @@
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
-    Aes256Gcm, Key, Nonce,
+    Aes256Gcm, Nonce,
 };
-use hmac::digest::KeyInit as HmacKeyInit;
-use hmac::{Hmac, Mac};
 use log::{debug, warn};
 use rand::RngCore;
-use sha2::Sha256;
 use zeroize::Zeroizing;
-
-type HmacSha256 = Hmac<Sha256>;
 
 // ---------------------------------------------------------------------------
 // Encrypted payload envelope
@@ -44,11 +39,12 @@ pub fn encrypt_payload(key: &[u8; 32], plaintext: &[u8]) -> Result<EncryptedPayl
     let mut nonce_bytes = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
 
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| "[crypto] Invalid AES-256-GCM key".to_string())?;
+    let nonce = Nonce::from(nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|_| "[crypto] AES-256-GCM encryption failed".to_string())?;
 
     debug!(
@@ -70,11 +66,12 @@ pub fn decrypt_payload(
     key: &[u8; 32],
     payload: EncryptedPayload,
 ) -> Result<Zeroizing<Vec<u8>>, String> {
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let nonce = Nonce::from_slice(&payload.nonce);
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| "[crypto] Invalid AES-256-GCM key".to_string())?;
+    let nonce = Nonce::from(payload.nonce);
 
     let plaintext = cipher
-        .decrypt(nonce, payload.ciphertext.as_ref())
+        .decrypt(&nonce, payload.ciphertext.as_ref())
         .map_err(|_| {
             warn!("[crypto] AES-256-GCM decryption failed — authentication tag mismatch");
             "[crypto] Decryption failed: authentication tag mismatch".to_string()
@@ -86,54 +83,4 @@ pub fn decrypt_payload(
         plaintext.len()
     );
     Ok(Zeroizing::new(plaintext))
-}
-
-// ---------------------------------------------------------------------------
-// HMAC-SHA256
-// ---------------------------------------------------------------------------
-
-/// Compute HMAC-SHA256(key, data) and return the 32-byte result.
-pub fn compute_hmac(key: &[u8], data: &[u8]) -> Result<[u8; 32], String> {
-    let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(key)
-        .map_err(|e| format!("[crypto] HMAC init failed: {e}"))?;
-    mac.update(data);
-    let result = mac.finalize().into_bytes();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&result);
-    Ok(out)
-}
-
-/// Verify HMAC-SHA256(key, data) == expected in constant time.
-pub fn verify_hmac(key: &[u8], data: &[u8], expected: &[u8]) -> bool {
-    let mut mac = match <HmacSha256 as HmacKeyInit>::new_from_slice(key) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("[crypto] HMAC verify init failed: {e}");
-            return false;
-        }
-    };
-    mac.update(data);
-    mac.verify_slice(expected).is_ok()
-}
-
-// ---------------------------------------------------------------------------
-// Convenience: encrypt a session token with the bootstrap key
-// ---------------------------------------------------------------------------
-
-/// Wrap a 32-byte session token in an AES-GCM envelope keyed by the bootstrap
-/// secret.  Returns the envelope as a JSON string (base64url nonce + ciphertext).
-pub fn wrap_session_token(bootstrap_key: &[u8; 32], token: &[u8; 32]) -> Result<String, String> {
-    let envelope = encrypt_payload(bootstrap_key, token)?;
-    serde_json::to_string(&envelope)
-        .map_err(|e| format!("[crypto] Failed to serialise session token envelope: {e}"))
-}
-
-/// Unwrap a JSON session token envelope produced by `wrap_session_token`.
-pub fn unwrap_session_token(
-    bootstrap_key: &[u8; 32],
-    wrapped: &str,
-) -> Result<Zeroizing<Vec<u8>>, String> {
-    let envelope: EncryptedPayload = serde_json::from_str(wrapped)
-        .map_err(|e| format!("[crypto] Invalid session token envelope JSON: {e}"))?;
-    decrypt_payload(bootstrap_key, envelope)
 }

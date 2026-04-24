@@ -42,14 +42,20 @@ sudo rm -f /etc/systemd/system/mykey-daemon.service
 sudo systemctl daemon-reload
 
 sudo rm -f /usr/local/bin/mykey-daemon
+sudo rm -f /usr/local/bin/mykey
 sudo rm -f /usr/local/bin/mykey-tray
 sudo rm -f /usr/local/bin/mykey-secrets
 sudo rm -f /usr/local/bin/mykey-migrate
 sudo rm -f /usr/local/bin/mykey-pin
 sudo rm -f /usr/local/bin/mykey-pin-auth
 sudo rm -f /usr/local/bin/mykey-auth
+sudo rm -f /usr/local/bin/mykey-elevated-auth
+sudo rm -f /usr/local/bin/mykey-security-key
+sudo rm -f /usr/local/bin/mykey-security-key-auth
 sudo rm -f /usr/lib/security/mykeypin.so
 sudo rm -f /usr/lib/security/pam_mykey.so
+sudo rm -f /etc/pam.d/mykey-elevated-auth
+sudo rm -f /etc/pam.d/mykey-security-key-auth
 sudo rm -rf /etc/mykey/pin
 sudo rm -f /etc/dbus-1/system.d/com.mykey.Daemon.conf
 sudo rm -f /etc/dbus-1/session.d/org.freedesktop.secrets.conf

@@ -10,7 +10,9 @@ Use these documents first:
 - [Daemon Component](components/daemon.md)
 - [Secrets Component](components/secrets.md)
 - [Tray Component](components/tray.md)
+- [mykey Command](commands/mykey.md)
 - [mykey-auth Command](commands/mykey-auth.md)
+- [mykey-security-key Command](commands/mykey-security-key.md)
 - [mykey-migrate Command](commands/mykey-migrate.md)
 - [Arch Packaging](packaging/arch.md)
 
@@ -26,6 +28,6 @@ What is intentionally not broken out yet:
 - GUI flows
 - walkthrough-style onboarding guides
 - browser-platform-authenticator research notes
-- future security-key and passkey implementation details
+- future passkey implementation details
 
 Those can be added later once the behavior is stable enough to document once.

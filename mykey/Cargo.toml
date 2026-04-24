@@ -1,0 +1,10 @@
+[package]
+name = "mykey-control"
+version = "0.1.0"
+edition = "2021"
+description = "Top-level MyKey terminal control surface"
+license = "MIT"
+
+[[bin]]
+name = "mykey"
+path = "src/main.rs"

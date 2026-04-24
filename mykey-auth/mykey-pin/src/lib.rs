@@ -12,10 +12,8 @@ use std::process::{Command, Stdio};
 
 use zeroize::Zeroizing;
 
-const PIN_HELPER_CANDIDATES: &[&str] = &[
-    "/usr/local/bin/mykey-pin-auth",
-    "/usr/bin/mykey-pin-auth",
-];
+const PIN_HELPER_CANDIDATES: &[&str] =
+    &["/usr/local/bin/mykey-pin-auth", "/usr/bin/mykey-pin-auth"];
 
 // ---------------------------------------------------------------------------
 // Inline PAM FFI — avoids assumptions about pam_sys binding details.
@@ -221,9 +219,7 @@ fn run_pin_helper_verify(uid: u32, pin: &[u8]) -> HelperVerifyResult {
     {
         Ok(child) => child,
         Err(e) => {
-            return HelperVerifyResult::Error(format!(
-                "Could not launch mykey-pin-auth: {e}"
-            ));
+            return HelperVerifyResult::Error(format!("Could not launch mykey-pin-auth: {e}"));
         }
     };
 
@@ -231,9 +227,7 @@ fn run_pin_helper_verify(uid: u32, pin: &[u8]) -> HelperVerifyResult {
         if let Err(e) = stdin.write_all(pin) {
             let _ = child.kill();
             let _ = child.wait();
-            return HelperVerifyResult::Error(format!(
-                "Could not send PIN to mykey-pin-auth: {e}"
-            ));
+            return HelperVerifyResult::Error(format!("Could not send PIN to mykey-pin-auth: {e}"));
         }
     } else {
         let _ = child.kill();
@@ -246,9 +240,7 @@ fn run_pin_helper_verify(uid: u32, pin: &[u8]) -> HelperVerifyResult {
     let output = match child.wait_with_output() {
         Ok(output) => output,
         Err(e) => {
-            return HelperVerifyResult::Error(format!(
-                "Failed waiting for mykey-pin-auth: {e}"
-            ));
+            return HelperVerifyResult::Error(format!("Failed waiting for mykey-pin-auth: {e}"));
         }
     };
 
@@ -289,11 +281,7 @@ pub struct MyKeyPinModule;
 
 impl PamModule for MyKeyPinModule {
     /// Authenticate the user by prompting for a PIN and dispatching helper verification.
-    fn authenticate(
-        handle: &pam::PamHandle,
-        _args: Vec<&CStr>,
-        _flags: c_uint,
-    ) -> PamReturnCode {
+    fn authenticate(handle: &pam::PamHandle, _args: Vec<&CStr>, _flags: c_uint) -> PamReturnCode {
         let username = unsafe {
             match pam_user(handle) {
                 Some(user) => user,
@@ -336,11 +324,14 @@ impl PamModule for MyKeyPinModule {
             | HelperVerifyResult::NotConfigured(msg)
             | HelperVerifyResult::Error(msg) => {
                 unsafe {
-                    pam_error(handle, if msg.is_empty() {
-                        "MyKey PIN authentication failed."
-                    } else {
-                        &msg
-                    });
+                    pam_error(
+                        handle,
+                        if msg.is_empty() {
+                            "MyKey PIN authentication failed."
+                        } else {
+                            &msg
+                        },
+                    );
                 }
                 PamReturnCode::Auth_Err
             }

@@ -1,7 +1,8 @@
-// daemon_client.rs — Async D-Bus client for the unified MyKey auth helper.
+// runtime_daemon_client.rs — Async D-Bus client for MyKey runtime auth flows.
 //
-// This is intentionally small for Phase A of pam_mykey: connect to the daemon,
-// query PIN state, verify a PIN, and disconnect.
+// This client is intentionally scoped to the `mykey-auth` runtime and
+// biometric-management surface so each helper binary only compiles the daemon
+// methods it actually uses.
 
 use log::{debug, info};
 use zbus::{CacheProperties, Connection};
@@ -13,12 +14,20 @@ use zbus::{CacheProperties, Connection};
 )]
 trait DaemonIface {
     async fn connect(&self, pid: u32) -> zbus::Result<Vec<u8>>;
-    async fn confirm_user_presence(&self, pid: u32) -> zbus::Result<bool>;
     async fn local_auth_status(
         &self,
         pid: u32,
         target_uid: u32,
-    ) -> zbus::Result<(bool, String, bool, String)>;
+    ) -> zbus::Result<(bool, Vec<String>, Vec<String>, bool, bool, u8)>;
+    async fn password_fallback_status(&self, pid: u32, target_uid: u32)
+        -> zbus::Result<(u64, u32)>;
+    async fn record_password_fallback_failure(
+        &self,
+        pid: u32,
+        target_uid: u32,
+    ) -> zbus::Result<(u64, u32)>;
+    async fn clear_password_fallback_failures(&self, pid: u32, target_uid: u32)
+        -> zbus::Result<()>;
     async fn seal_secret(&self, pid: u32, data: Vec<u8>) -> zbus::Result<Vec<u8>>;
     async fn unseal_secret(&self, pid: u32, blob: Vec<u8>) -> zbus::Result<Vec<u8>>;
     async fn enable_biometric_backend(
@@ -26,6 +35,12 @@ trait DaemonIface {
         pid: u32,
         target_uid: u32,
         backend: String,
+    ) -> zbus::Result<()>;
+    async fn set_biometric_backends(
+        &self,
+        pid: u32,
+        target_uid: u32,
+        backends: Vec<String>,
     ) -> zbus::Result<()>;
     async fn disable_biometric_backend(&self, pid: u32, target_uid: u32) -> zbus::Result<()>;
     async fn pin_status(&self, pid: u32, target_uid: u32) -> zbus::Result<(bool, u64, u32)>;
@@ -56,9 +71,23 @@ pub struct PinStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalAuthStatus {
     pub enabled: bool,
-    pub primary_method: String,
-    pub pin_fallback_enabled: bool,
-    pub biometric_backend: Option<String>,
+    pub auth_chain: Vec<String>,
+    pub biometric_backends: Vec<String>,
+    pub password_fallback_allowed: bool,
+    pub elevated_password_required: bool,
+    pub biometric_attempt_limit: u8,
+}
+
+impl LocalAuthStatus {
+    pub fn has_stage(&self, stage: &str) -> bool {
+        self.auth_chain.iter().any(|candidate| candidate == stage)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasswordFallbackStatus {
+    pub retry_after_secs: u64,
+    pub failed_attempts: u32,
 }
 
 impl DaemonClient {
@@ -95,31 +124,67 @@ impl DaemonClient {
 
     pub async fn local_auth_status(&self, target_uid: u32) -> Result<LocalAuthStatus, String> {
         debug!("[mykey-auth] LocalAuthStatus (target_uid={target_uid})");
-        let (enabled, primary_method, pin_fallback_enabled, biometric_backend) =
-            make_proxy(&self.conn)
-                .await?
-                .local_auth_status(self.pid, target_uid)
-                .await
-                .map_err(|e| format!("D-Bus LocalAuthStatus failed: {e}"))?;
+        let (
+            enabled,
+            auth_chain,
+            biometric_backends,
+            password_fallback_allowed,
+            elevated_password_required,
+            biometric_attempt_limit,
+        ) = make_proxy(&self.conn)
+            .await?
+            .local_auth_status(self.pid, target_uid)
+            .await
+            .map_err(|e| format!("D-Bus LocalAuthStatus failed: {e}"))?;
         Ok(LocalAuthStatus {
             enabled,
-            primary_method,
-            pin_fallback_enabled,
-            biometric_backend: if biometric_backend.is_empty() {
-                None
-            } else {
-                Some(biometric_backend)
-            },
+            auth_chain,
+            biometric_backends,
+            password_fallback_allowed,
+            elevated_password_required,
+            biometric_attempt_limit,
         })
     }
 
-    pub async fn confirm_user_presence(&self) -> Result<bool, String> {
-        debug!("[mykey-auth] ConfirmUserPresence");
+    pub async fn password_fallback_status(
+        &self,
+        target_uid: u32,
+    ) -> Result<PasswordFallbackStatus, String> {
+        debug!("[mykey-auth] PasswordFallbackStatus (target_uid={target_uid})");
+        let (retry_after_secs, failed_attempts) = make_proxy(&self.conn)
+            .await?
+            .password_fallback_status(self.pid, target_uid)
+            .await
+            .map_err(|e| format!("D-Bus PasswordFallbackStatus failed: {e}"))?;
+        Ok(PasswordFallbackStatus {
+            retry_after_secs,
+            failed_attempts,
+        })
+    }
+
+    pub async fn record_password_fallback_failure(
+        &self,
+        target_uid: u32,
+    ) -> Result<PasswordFallbackStatus, String> {
+        debug!("[mykey-auth] RecordPasswordFallbackFailure (target_uid={target_uid})");
+        let (retry_after_secs, failed_attempts) = make_proxy(&self.conn)
+            .await?
+            .record_password_fallback_failure(self.pid, target_uid)
+            .await
+            .map_err(|e| format!("D-Bus RecordPasswordFallbackFailure failed: {e}"))?;
+        Ok(PasswordFallbackStatus {
+            retry_after_secs,
+            failed_attempts,
+        })
+    }
+
+    pub async fn clear_password_fallback_failures(&self, target_uid: u32) -> Result<(), String> {
+        debug!("[mykey-auth] ClearPasswordFallbackFailures (target_uid={target_uid})");
         make_proxy(&self.conn)
             .await?
-            .confirm_user_presence(self.pid)
+            .clear_password_fallback_failures(self.pid, target_uid)
             .await
-            .map_err(|e| format!("D-Bus ConfirmUserPresence failed: {e}"))
+            .map_err(|e| format!("D-Bus ClearPasswordFallbackFailures failed: {e}"))
     }
 
     pub async fn seal_secret(&self, data: &[u8]) -> Result<Vec<u8>, String> {
@@ -140,17 +205,20 @@ impl DaemonClient {
             .map_err(|e| format!("D-Bus UnsealSecret failed: {e}"))
     }
 
-    pub async fn enable_biometric_backend(
+    pub async fn set_biometric_backends(
         &self,
         target_uid: u32,
-        backend: &str,
+        backends: &[String],
     ) -> Result<(), String> {
-        debug!("[mykey-auth] EnableBiometricBackend (target_uid={target_uid}, backend={backend})");
+        debug!(
+            "[mykey-auth] SetBiometricBackends (target_uid={target_uid}, backends={})",
+            backends.join(",")
+        );
         make_proxy(&self.conn)
             .await?
-            .enable_biometric_backend(self.pid, target_uid, backend.to_string())
+            .set_biometric_backends(self.pid, target_uid, backends.to_vec())
             .await
-            .map_err(|e| format!("D-Bus EnableBiometricBackend failed: {e}"))
+            .map_err(|e| format!("D-Bus SetBiometricBackends failed: {e}"))
     }
 
     pub async fn disable_biometric_backend(&self, target_uid: u32) -> Result<(), String> {

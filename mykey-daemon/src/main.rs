@@ -10,13 +10,16 @@
 use log::{error, info};
 use std::sync::Arc;
 
+mod auth_backoff;
 mod authentication;
 mod credentials;
 mod crypto;
 mod crypto_ops;
 mod dbus_interface;
+mod elevated_auth;
 mod local_auth_policy;
 mod pam;
+mod password_fallback;
 mod pin_store;
 mod prereqs;
 mod protocol;

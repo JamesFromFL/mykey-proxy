@@ -1,14 +1,25 @@
 # mykey-security-key
 
-Planned home for MyKey security-key setup and management.
+First-wave MyKey security-key management and test surface.
 
-This module will eventually provide:
+Current scope:
 
-- setup, status, test, and reset flows for local security-key authentication
-- integration with the existing system security-key/FIDO2 stack rather than a reimplementation of key verification inside MyKey
-- backend validation before MyKey policy is enabled
-- MyKey-managed security-key policy enablement behind `pam_mykey.so`
+- `sudo mykey-security-key enroll [--nickname <name>]`
+- `sudo mykey-security-key status`
+- `sudo mykey-security-key unenroll`
+- `mykey-security-key test`
+- TPM-sealed per-user metadata under `/etc/mykey/auth/<uid>/security-keys.registry.sealed`
+- a shared MyKey-owned `pam_u2f` authfile at `/etc/mykey/security-keys.pam_u2f`
+- elevated Linux-password verification for enroll and unenroll through `mykey-elevated-auth`
 
-It is intentionally a placeholder for now while `mykey-pam` Phase A, daemon
-local-auth policy, and the existing `mykey-pin` fallback backend continue to
-stabilize.
+This crate intentionally uses existing system security-key tooling instead of
+reimplementing verification in MyKey:
+
+- `pamu2fcfg` for enrollment
+- `pam_u2f` for test-time authentication
+
+What is still not done:
+
+- daemon-owned security-key policy
+- `pam_mykey.so` runtime orchestration for security-key-first auth
+- broader host-installed validation of the `pam_u2f` runtime path

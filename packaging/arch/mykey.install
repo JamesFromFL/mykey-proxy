@@ -1,31 +1,40 @@
 post_install() {
-  cat <<'EOF'
-MyKey was installed, but no services were enabled automatically.
+  daemon_status_message="  - mykey-daemon was enabled and started successfully."
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if ! systemctl enable --now mykey-daemon >/dev/null 2>&1; then
+      daemon_status_message="  - mykey-daemon could not be enabled and started automatically. Run: sudo systemctl enable --now mykey-daemon"
+    fi
+  else
+    daemon_status_message="  - systemctl was not available during install. Run: sudo systemctl enable --now mykey-daemon"
+  fi
+
+  cat <<EOF
+Installation complete.
+
+${daemon_status_message}
 
 Recommended next steps:
-  1. Enable and start the daemon:
-     sudo systemctl enable --now mykey-daemon
+  1. See the top-level control surface:
+     mykey --help
 
-  2. Enroll MyKey as your Secret Service provider:
+  2. Run the unified auth setup:
+     sudo mykey-auth setup
+
+  3. Optionally enroll MyKey as your Secret Service provider:
      mykey-migrate --enroll
      Do not manually enable mykey-secrets first on initial setup.
      The migration flow owns provider handoff and will enable/start
      mykey-secrets only after the old provider has been copied and stopped.
 
-  3. If you want local PIN auth:
-     mykey-pin set
-
-  4. If you want MyKey to take over supported PAM auth prompts:
-     sudo mykey-auth enable
-     This will offer MyKey login setup at the end.
-
-  5. Optionally enable the tray:
-     mykey-tray enable
+  4. Optionally enable the tray:
+     mykey tray enable
 
 Useful status checks:
-  - mykey-auth status
-  - mykey-tray status
-  - mykey-pin status
+  - mykey status
+  - mykey tray status
+  - mykey pin status
+  - sudo systemctl status mykey-daemon
   - systemctl --user status mykey-secrets
   - journalctl -u mykey-daemon
 
@@ -37,7 +46,7 @@ Notes:
   - Package removal also preserves your per-user MyKey Secret Service data.
   - Use mykey-migrate --unenroll before uninstall if MyKey still owns
     your Secret Service data path.
-  - Use sudo mykey-auth disable before uninstall for a clean PAM teardown.
+  - Use sudo mykey disable before uninstall for a clean PAM teardown.
     This will also walk through MyKey login teardown.
     If you remove the package without doing that first, the managed PAM line
     is still designed to fall through because it uses -auth and ignores a
@@ -48,7 +57,21 @@ EOF
 }
 
 post_upgrade() {
-  post_install
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+
+  cat <<'EOF'
+MyKey was upgraded.
+
+Recommended next steps:
+  - Review the current control surface:
+    mykey --help
+  - If needed, restart the daemon:
+    sudo systemctl restart mykey-daemon
+  - Re-run auth setup only if you intentionally want to change your MyKey auth configuration:
+    sudo mykey-auth setup
+EOF
 }
 
 post_remove() {

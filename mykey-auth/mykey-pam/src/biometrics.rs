@@ -1,4 +1,4 @@
-use crate::daemon_client::{DaemonClient, LocalAuthStatus};
+use crate::daemon_client::DaemonClient;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -9,10 +9,34 @@ use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::task::JoinSet;
+use tokio::process::{Child, Command as TokioCommand};
+use zeroize::Zeroizing;
 
 const AUTH_ROOT: &str = "/etc/mykey/auth";
 const REGISTRY_FILENAME: &str = "biometrics.registry.sealed";
+const ELEVATED_AUTH_HELPER_CANDIDATES: &[&str] = &[
+    "/usr/local/bin/mykey-elevated-auth",
+    "/usr/bin/mykey-elevated-auth",
+];
+const FPRINTD_RUNTIME_TIMEOUT: Duration = Duration::from_secs(10);
+const HOWDY_RUNTIME_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeVerificationResult {
+    Success,
+    Failed,
+    Unavailable(String),
+    TimedOut(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeBiometricAttemptResult {
+    Success,
+    Failed(String),
+    Unavailable(String),
+}
 
 pub async fn run(target_uid: u32, system_username: &str) {
     let client = match DaemonClient::connect().await {
@@ -27,20 +51,6 @@ pub async fn run(target_uid: u32, system_username: &str) {
         client.disconnect().await;
         eprintln!("{e}");
         std::process::exit(1);
-    }
-
-    match client.confirm_user_presence().await {
-        Ok(true) => {}
-        Ok(false) => {
-            client.disconnect().await;
-            eprintln!("MyKey user presence check was not approved.");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            client.disconnect().await;
-            eprintln!("Could not confirm user presence: {e}");
-            std::process::exit(1);
-        }
     }
 
     print_disclaimer();
@@ -85,6 +95,198 @@ pub async fn run(target_uid: u32, system_username: &str) {
     client.disconnect().await;
 }
 
+pub async fn verify_group_for_login(
+    backends: &[String],
+    system_username: &str,
+) -> RuntimeBiometricAttemptResult {
+    let mut handles = Vec::new();
+    let mut unavailable_messages = Vec::new();
+
+    for backend in backends {
+        match start_runtime_verifier(backend, system_username) {
+            Ok(handle) => handles.push(handle),
+            Err(message) => unavailable_messages.push(message),
+        }
+    }
+
+    if handles.is_empty() {
+        return RuntimeBiometricAttemptResult::Unavailable(format_unavailable_messages(
+            unavailable_messages,
+            "MyKey biometric verification could not start because no enrolled biometric provider is available."
+                .to_string(),
+        ));
+    }
+
+    match wait_for_runtime_group(handles).await {
+        RuntimeGroupExecutionResult::Success => RuntimeBiometricAttemptResult::Success,
+        RuntimeGroupExecutionResult::Failed(mut details) => {
+            if !unavailable_messages.is_empty() {
+                details.extend(unavailable_messages);
+            }
+            RuntimeBiometricAttemptResult::Failed(format_failed_attempt_message(
+                backends,
+                &details,
+            ))
+        }
+    }
+}
+
+pub fn start_runtime_verifier(
+    backend: &str,
+    system_username: &str,
+) -> Result<RuntimeVerificationHandle, String> {
+    let provider = match ProviderKind::from_backend_name(backend) {
+        Some(provider) => provider,
+        None => return Err(format!("Unsupported MyKey biometric backend: {backend}")),
+    };
+
+    match provider {
+        ProviderKind::Fprintd => RuntimeVerificationHandle::spawn(
+            provider,
+            "fprintd-verify",
+            &[system_username.to_string()],
+            FPRINTD_RUNTIME_TIMEOUT,
+        ),
+        ProviderKind::Howdy => RuntimeVerificationHandle::spawn(
+            provider,
+            "howdy",
+            &[
+                "-U".to_string(),
+                system_username.to_string(),
+                "test".to_string(),
+            ],
+            HOWDY_RUNTIME_TIMEOUT,
+        ),
+    }
+}
+
+pub struct RuntimeVerificationHandle {
+    provider: ProviderKind,
+    timeout: Duration,
+    child: Child,
+}
+
+impl RuntimeVerificationHandle {
+    fn spawn(
+        provider: ProviderKind,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        let mut command = TokioCommand::new(program);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+
+        let child = command.spawn().map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                format!(
+                    "Required {} verifier '{}' is not installed.",
+                    provider.runtime_label(),
+                    program
+                )
+            } else {
+                format!(
+                    "Could not launch {} verifier '{}': {e}",
+                    provider.runtime_label(),
+                    program
+                )
+            }
+        })?;
+
+        Ok(Self {
+            provider,
+            timeout,
+            child,
+        })
+    }
+
+    pub async fn wait(&mut self) -> RuntimeVerificationResult {
+        match tokio::time::timeout(self.timeout, self.child.wait()).await {
+            Ok(Ok(status)) if status.success() => RuntimeVerificationResult::Success,
+            Ok(Ok(_)) => RuntimeVerificationResult::Failed,
+            Ok(Err(e)) => RuntimeVerificationResult::Unavailable(format!(
+                "Could not wait for {} verification to complete: {e}",
+                self.provider.runtime_label()
+            )),
+            Err(_) => {
+                let _ = self.cancel().await;
+                RuntimeVerificationResult::TimedOut(format!(
+                    "MyKey {} verification timed out after {} seconds.",
+                    self.provider.runtime_label(),
+                    self.timeout.as_secs()
+                ))
+            }
+        }
+    }
+
+    pub async fn cancel(&mut self) -> Result<(), String> {
+        match self.child.kill().await {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
+            Err(e) => {
+                return Err(format!(
+                    "Could not cancel {} verification cleanly: {e}",
+                    self.provider.runtime_label()
+                ));
+            }
+        }
+        let _ = self.child.wait().await;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeGroupExecutionResult {
+    Success,
+    Failed(Vec<String>),
+}
+
+async fn wait_for_runtime_group(
+    handles: Vec<RuntimeVerificationHandle>,
+) -> RuntimeGroupExecutionResult {
+    let mut tasks = JoinSet::new();
+    for mut handle in handles {
+        tasks.spawn(async move {
+            let result = handle.wait().await;
+            result
+        });
+    }
+
+    let mut failure_details = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(RuntimeVerificationResult::Success) => {
+                tasks.abort_all();
+                while let Some(next) = tasks.join_next().await {
+                    match next {
+                        Ok(_) => {}
+                        Err(err) if err.is_cancelled() => {}
+                        Err(err) => failure_details.push(format!(
+                            "Could not cancel a MyKey biometric verifier cleanly: {err}"
+                        )),
+                    }
+                }
+                return RuntimeGroupExecutionResult::Success;
+            }
+            Ok(RuntimeVerificationResult::Failed) => {}
+            Ok(RuntimeVerificationResult::Unavailable(message))
+            | Ok(RuntimeVerificationResult::TimedOut(message)) => {
+                failure_details.push(message);
+            }
+            Err(err) if err.is_cancelled() => {}
+            Err(err) => failure_details.push(format!(
+                "Could not complete MyKey biometric verification cleanly: {err}"
+            )),
+        }
+    }
+
+    RuntimeGroupExecutionResult::Failed(failure_details)
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 enum ProviderKind {
@@ -105,6 +307,81 @@ impl ProviderKind {
             Self::Fprintd => "Fingerprint (fprintd)",
             Self::Howdy => "Face (Howdy)",
         }
+    }
+
+    fn runtime_label(self) -> &'static str {
+        match self {
+            Self::Fprintd => "fingerprint",
+            Self::Howdy => "face",
+        }
+    }
+
+    fn from_backend_name(name: &str) -> Option<Self> {
+        match name {
+            "fprintd" => Some(Self::Fprintd),
+            "howdy" => Some(Self::Howdy),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn runtime_prompt_for_backends(backends: &[String]) -> Option<String> {
+    let providers: BTreeSet<_> = backends
+        .iter()
+        .filter_map(|backend| ProviderKind::from_backend_name(backend))
+        .collect();
+
+    match providers.iter().copied().collect::<Vec<_>>().as_slice() {
+        [ProviderKind::Fprintd] => Some(
+            "MyKey fingerprint verification in progress. Scan your enrolled finger now."
+                .to_string(),
+        ),
+        [ProviderKind::Howdy] => {
+            Some("MyKey face verification in progress. Look at the camera now.".to_string())
+        }
+        [ProviderKind::Fprintd, ProviderKind::Howdy] => Some(
+            "MyKey biometric verification in progress. Scan your enrolled finger or look at the camera now."
+                .to_string(),
+        ),
+        _ if providers.is_empty() => None,
+        _ => Some(
+            "MyKey biometric verification in progress. Use your enrolled biometric device now."
+                .to_string(),
+        ),
+    }
+}
+
+fn format_failed_attempt_message(backends: &[String], details: &[String]) -> String {
+    let mut sections = Vec::new();
+    if !details.is_empty() {
+        sections.push(details.join("\n"));
+    }
+    sections.push(format!(
+        "MyKey {} verification did not succeed.",
+        biometric_stage_label(backends)
+    ));
+    sections.join("\n")
+}
+
+fn format_unavailable_messages(messages: Vec<String>, fallback: String) -> String {
+    if messages.is_empty() {
+        fallback
+    } else {
+        messages.join("\n")
+    }
+}
+
+fn biometric_stage_label(backends: &[String]) -> &'static str {
+    let providers: BTreeSet<_> = backends
+        .iter()
+        .filter_map(|backend| ProviderKind::from_backend_name(backend))
+        .collect();
+
+    match providers.iter().copied().collect::<Vec<_>>().as_slice() {
+        [ProviderKind::Fprintd] => "fingerprint",
+        [ProviderKind::Howdy] => "face",
+        _ => "biometric",
     }
 }
 
@@ -210,8 +487,7 @@ impl BiometricRegistry {
                 .collect();
         }
         self.tracked_people.clear();
-        self.enrollments
-            .sort_by_key(|entry| entry.recorded_at_unix);
+        self.enrollments.sort_by_key(|entry| entry.recorded_at_unix);
         self
     }
 
@@ -242,8 +518,7 @@ impl BiometricRegistry {
     }
 
     fn remove_provider(&mut self, provider: ProviderKind) {
-        self.enrollments
-            .retain(|entry| entry.provider != provider);
+        self.enrollments.retain(|entry| entry.provider != provider);
     }
 }
 
@@ -272,48 +547,35 @@ async fn enroll_flow(
         let mut successful_providers = Vec::new();
         match provider_mode {
             0 => {
-                if enroll_fprintd(
-                    client,
+                require_elevated_password(
                     target_uid,
-                    system_username,
-                    &mut registry,
-                )
-                .await?
-                {
+                    "biometric_manage",
+                    "Biometric enrollment requires verifying your Linux account password.",
+                )?;
+                if enroll_fprintd(client, target_uid, system_username, &mut registry).await? {
                     successful_providers.push(ProviderKind::Fprintd);
                 }
             }
             1 => {
-                if enroll_howdy(
-                    client,
+                require_elevated_password(
                     target_uid,
-                    system_username,
-                    &mut registry,
-                )
-                .await?
-                {
+                    "biometric_manage",
+                    "Biometric enrollment requires verifying your Linux account password.",
+                )?;
+                if enroll_howdy(client, target_uid, system_username, &mut registry).await? {
                     successful_providers.push(ProviderKind::Howdy);
                 }
             }
             2 => {
-                if enroll_fprintd(
-                    client,
+                require_elevated_password(
                     target_uid,
-                    system_username,
-                    &mut registry,
-                )
-                .await?
-                {
+                    "biometric_manage",
+                    "Biometric enrollment requires verifying your Linux account password.",
+                )?;
+                if enroll_fprintd(client, target_uid, system_username, &mut registry).await? {
                     successful_providers.push(ProviderKind::Fprintd);
                 }
-                if enroll_howdy(
-                    client,
-                    target_uid,
-                    system_username,
-                    &mut registry,
-                )
-                .await?
-                {
+                if enroll_howdy(client, target_uid, system_username, &mut registry).await? {
                     successful_providers.push(ProviderKind::Howdy);
                 }
             }
@@ -323,13 +585,7 @@ async fn enroll_flow(
 
         if !successful_providers.is_empty() {
             save_registry(client, target_uid, &registry).await?;
-            select_active_backend(
-                client,
-                target_uid,
-                &registry,
-                successful_providers.last().copied(),
-            )
-            .await?;
+            sync_active_backends(client, target_uid, &registry).await?;
         }
 
         if !prompt_yes_no("Would you like to perform another scan? [y/N]: ", false)? {
@@ -344,8 +600,6 @@ async fn unenroll_flow(
     system_username: &str,
 ) -> Result<(), String> {
     let mut registry = load_registry(client, target_uid, system_username).await?;
-    let status = client.local_auth_status(target_uid).await?;
-
     println!("Unenroll options:");
     println!("  1. Remove biometrics from the MyKey auth chain only");
     println!("  2. Remove all fingerprint enrollments for this Linux account");
@@ -364,40 +618,46 @@ async fn unenroll_flow(
         ],
     )? {
         0 => {
+            require_elevated_password(
+                target_uid,
+                "biometric_manage",
+                "Changing MyKey biometric management requires verifying your Linux account password.",
+            )?;
             client.disable_biometric_backend(target_uid).await?;
             println!("Biometric auth removed from the MyKey auth chain. Provider data was kept.");
         }
         1 => {
+            require_elevated_password(
+                target_uid,
+                "biometric_manage",
+                "Removing biometric data requires verifying your Linux account password.",
+            )?;
             if delete_fprintd_data(system_username)? {
                 registry.remove_provider(ProviderKind::Fprintd);
                 save_registry(client, target_uid, &registry).await?;
-                update_backend_after_provider_removal(
-                    client,
-                    target_uid,
-                    &registry,
-                    &status,
-                    ProviderKind::Fprintd,
-                )
-                .await?;
+                sync_active_backends(client, target_uid, &registry).await?;
                 println!("Removed all fingerprint enrollment data for {system_username}.");
             }
         }
         2 => {
+            require_elevated_password(
+                target_uid,
+                "biometric_manage",
+                "Removing biometric data requires verifying your Linux account password.",
+            )?;
             if delete_howdy_data(system_username)? {
                 registry.remove_provider(ProviderKind::Howdy);
                 save_registry(client, target_uid, &registry).await?;
-                update_backend_after_provider_removal(
-                    client,
-                    target_uid,
-                    &registry,
-                    &status,
-                    ProviderKind::Howdy,
-                )
-                .await?;
+                sync_active_backends(client, target_uid, &registry).await?;
                 println!("Removed all face enrollment data for {system_username}.");
             }
         }
         3 => {
+            require_elevated_password(
+                target_uid,
+                "biometric_manage",
+                "Removing biometric data requires verifying your Linux account password.",
+            )?;
             let deleted_fprint = delete_fprintd_data(system_username)?;
             let deleted_howdy = delete_howdy_data(system_username)?;
             if deleted_fprint {
@@ -408,11 +668,7 @@ async fn unenroll_flow(
             }
             if deleted_fprint || deleted_howdy {
                 save_registry(client, target_uid, &registry).await?;
-                if registry.providers_present().is_empty() {
-                    client.disable_biometric_backend(target_uid).await?;
-                } else {
-                    select_active_backend(client, target_uid, &registry, None).await?;
-                }
+                sync_active_backends(client, target_uid, &registry).await?;
                 println!("Updated biometric provider data and MyKey biometric policy.");
             }
         }
@@ -441,13 +697,22 @@ async fn status_flow(
         println!("  - {}", registry.registration_summary());
     }
 
-    if status.primary_method == "biometric" {
+    if status.has_stage("biometric") {
         println!(
-            "Active MyKey biometric backend: {}",
-            status.biometric_backend.as_deref().unwrap_or("unknown")
+            "Active MyKey biometric backend{}: {}",
+            if status.biometric_backends.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            if status.biometric_backends.is_empty() {
+                "unknown".to_string()
+            } else {
+                status.biometric_backends.join(", ")
+            }
         );
     } else {
-        println!("Active MyKey biometric backend: none");
+        println!("Active MyKey biometric backends: none");
     }
     Ok(())
 }
@@ -521,10 +786,7 @@ async fn enroll_howdy(
         "No camera device was detected automatically.",
     )?;
 
-    println!(
-        "Starting Howdy enrollment for {}.",
-        registry.account_name
-    );
+    println!("Starting Howdy enrollment for {}.", registry.account_name);
     run_interactive_command("howdy", &["-U", system_username, "add"])?;
 
     let now = now_recorded_at();
@@ -554,11 +816,10 @@ async fn ensure_pin_prerequisite(client: &DaemonClient, target_uid: u32) -> Resu
     Ok(())
 }
 
-async fn select_active_backend(
+async fn sync_active_backends(
     client: &DaemonClient,
     target_uid: u32,
     registry: &BiometricRegistry,
-    preferred: Option<ProviderKind>,
 ) -> Result<(), String> {
     let providers: Vec<_> = registry.providers_present().into_iter().collect();
     if providers.is_empty() {
@@ -567,59 +828,20 @@ async fn select_active_backend(
         return Ok(());
     }
 
-    let selected = if providers.len() == 1 {
-        providers[0]
-    } else {
-        println!(
-            "MyKey can only treat one biometric backend as active at a time. The others stay enrolled but inactive."
-        );
-        let options: Vec<_> = providers.iter().map(|provider| provider.label()).collect();
-        let default_index = preferred
-            .and_then(|candidate| providers.iter().position(|provider| *provider == candidate))
-            .unwrap_or(0);
-        prompt_menu_selection_with_default(
-            "Select the active MyKey biometric backend",
-            &options,
-            default_index,
-        )
-        .map(|idx| providers[idx])?
-    };
-
-    client
-        .enable_biometric_backend(target_uid, selected.as_str())
-        .await?;
+    let backend_names: Vec<String> = providers
+        .iter()
+        .map(|provider| provider.as_str().to_string())
+        .collect();
+    client.set_biometric_backends(target_uid, &backend_names).await?;
     println!(
-        "Active MyKey biometric backend set to {}.",
-        selected.label()
+        "Active MyKey biometric stage set to {}.",
+        providers
+            .iter()
+            .map(|provider| provider.label())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     Ok(())
-}
-
-async fn update_backend_after_provider_removal(
-    client: &DaemonClient,
-    target_uid: u32,
-    registry: &BiometricRegistry,
-    status: &LocalAuthStatus,
-    removed_provider: ProviderKind,
-) -> Result<(), String> {
-    if status.primary_method != "biometric" {
-        return Ok(());
-    }
-
-    let active = status
-        .biometric_backend
-        .as_deref()
-        .and_then(|backend| match backend {
-            "fprintd" => Some(ProviderKind::Fprintd),
-            "howdy" => Some(ProviderKind::Howdy),
-            _ => None,
-        });
-
-    if active != Some(removed_provider) {
-        return Ok(());
-    }
-
-    select_active_backend(client, target_uid, registry, None).await
 }
 
 async fn load_registry(
@@ -823,6 +1045,19 @@ fn command_exists(name: &str) -> bool {
     output.success()
 }
 
+#[cfg(test)]
+fn combined_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) if stdout == stderr => stdout,
+        (false, false) => format!("{stdout}\n{stderr}"),
+    }
+}
+
 fn run_interactive_command(program: &str, args: &[&str]) -> Result<(), String> {
     let status = Command::new(program)
         .args(args)
@@ -848,6 +1083,112 @@ account name. It does not create or manage additional Linux users."
         "MyKey tracks biometric metadata and keeps it TPM-sealed, but the actual \
 fingerprint and face templates remain owned by the upstream biometric stacks."
     );
+}
+
+fn require_elevated_password(target_uid: u32, purpose: &str, intro: &str) -> Result<(), String> {
+    println!("{intro}");
+    let password = rpassword::prompt_password("Linux account password: ")
+        .map(Zeroizing::new)
+        .map_err(|e| format!("Could not read Linux password: {e}"))?;
+
+    match run_elevated_auth_helper(target_uid, purpose, password.as_bytes()) {
+        HelperAuthResult::Success => Ok(()),
+        HelperAuthResult::AuthFailed(message)
+        | HelperAuthResult::RateLimited(message)
+        | HelperAuthResult::Error(message) => Err(message),
+    }
+}
+
+enum HelperAuthResult {
+    Success,
+    AuthFailed(String),
+    RateLimited(String),
+    Error(String),
+}
+
+fn run_elevated_auth_helper(uid: u32, purpose: &str, password: &[u8]) -> HelperAuthResult {
+    let helper_path = match resolve_elevated_auth_helper_path() {
+        Some(path) => path,
+        None => {
+            return HelperAuthResult::Error(
+                "Could not find an installed mykey-elevated-auth helper.".to_string(),
+            );
+        }
+    };
+
+    let mut child = match Command::new(helper_path)
+        .args(["verify", "--uid", &uid.to_string(), "--purpose", purpose])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return HelperAuthResult::Error(format!("Could not launch mykey-elevated-auth: {e}"));
+        }
+    };
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        if let Err(e) = stdin.write_all(password) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return HelperAuthResult::Error(format!(
+                "Could not send password to mykey-elevated-auth: {e}"
+            ));
+        }
+    } else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return HelperAuthResult::Error(
+            "mykey-elevated-auth did not expose a writable stdin".to_string(),
+        );
+    }
+
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(e) => {
+            return HelperAuthResult::Error(format!("Failed waiting for mykey-elevated-auth: {e}"));
+        }
+    };
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match output.status.code() {
+        Some(0) => HelperAuthResult::Success,
+        Some(1) => HelperAuthResult::AuthFailed(non_empty_message(
+            stderr,
+            "Linux password verification failed.",
+        )),
+        Some(3) => HelperAuthResult::RateLimited(non_empty_message(
+            stderr,
+            "Elevated MyKey password auth is temporarily rate-limited.",
+        )),
+        Some(2) => HelperAuthResult::Error(non_empty_message(
+            stderr,
+            "Elevated MyKey password verification failed.",
+        )),
+        Some(code) => HelperAuthResult::Error(format!(
+            "mykey-elevated-auth exited unexpectedly with status {code}"
+        )),
+        None => HelperAuthResult::Error(
+            "mykey-elevated-auth terminated without an exit status".to_string(),
+        ),
+    }
+}
+
+fn resolve_elevated_auth_helper_path() -> Option<&'static str> {
+    ELEVATED_AUTH_HELPER_CANDIDATES
+        .iter()
+        .copied()
+        .find(|path| Path::new(path).is_file())
+}
+
+fn non_empty_message(message: String, fallback: &str) -> String {
+    if message.is_empty() {
+        fallback.to_string()
+    } else {
+        message
+    }
 }
 
 fn prompt_non_empty(prompt: &str) -> Result<String, String> {
@@ -1037,5 +1378,139 @@ mod tests {
         assert!(registry.tracked_people.is_empty());
         assert_eq!(registry.enrollments[0].mykey_id, "fprintd-1");
         assert_eq!(registry.enrollments[1].mykey_id, "howdy-2");
+    }
+
+    #[test]
+    fn runtime_prompt_matches_supported_backends() {
+        assert_eq!(
+            runtime_prompt_for_backends(&["fprintd".to_string()]),
+            Some(
+                "MyKey fingerprint verification in progress. Scan your enrolled finger now."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            runtime_prompt_for_backends(&["howdy".to_string()]),
+            Some("MyKey face verification in progress. Look at the camera now.".to_string())
+        );
+        assert_eq!(
+            runtime_prompt_for_backends(&["fprintd".to_string(), "howdy".to_string()]),
+            Some(
+                "MyKey biometric verification in progress. Scan your enrolled finger or look at the camera now."
+                    .to_string()
+            )
+        );
+        assert_eq!(runtime_prompt_for_backends(&["unknown".to_string()]), None);
+    }
+
+    #[test]
+    fn combined_output_prefers_non_empty_content() {
+        assert_eq!(combined_output(b"", b""), "");
+        assert_eq!(combined_output(b"hello\n", b""), "hello");
+        assert_eq!(combined_output(b"", b"error\n"), "error");
+        assert_eq!(combined_output(b"hello\n", b"hello\n"), "hello");
+        assert_eq!(combined_output(b"hello\n", b"error\n"), "hello\nerror");
+    }
+
+    #[tokio::test]
+    async fn runtime_verifier_reports_successful_process() {
+        let mut verifier = RuntimeVerificationHandle::spawn(
+            ProviderKind::Howdy,
+            "sh",
+            &["-c".to_string(), "exit 0".to_string()],
+            Duration::from_secs(1),
+        )
+        .expect("spawn test verifier");
+        assert_eq!(verifier.wait().await, RuntimeVerificationResult::Success);
+    }
+
+    #[tokio::test]
+    async fn runtime_verifier_reports_failed_process() {
+        let mut verifier = RuntimeVerificationHandle::spawn(
+            ProviderKind::Howdy,
+            "sh",
+            &["-c".to_string(), "exit 1".to_string()],
+            Duration::from_secs(1),
+        )
+        .expect("spawn test verifier");
+        assert_eq!(verifier.wait().await, RuntimeVerificationResult::Failed);
+    }
+
+    #[tokio::test]
+    async fn runtime_verifier_times_out_and_cleans_up() {
+        let mut verifier = RuntimeVerificationHandle::spawn(
+            ProviderKind::Howdy,
+            "sh",
+            &["-c".to_string(), "sleep 5".to_string()],
+            Duration::from_millis(50),
+        )
+        .expect("spawn test verifier");
+        match verifier.wait().await {
+            RuntimeVerificationResult::TimedOut(message) => {
+                assert!(message.contains("timed out"));
+            }
+            other => panic!("expected timeout result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_group_returns_first_success() {
+        let handles = vec![
+            RuntimeVerificationHandle::spawn(
+                ProviderKind::Howdy,
+                "sh",
+                &["-c".to_string(), "sleep 5".to_string()],
+                Duration::from_secs(10),
+            )
+            .expect("spawn slower verifier"),
+            RuntimeVerificationHandle::spawn(
+                ProviderKind::Fprintd,
+                "sh",
+                &["-c".to_string(), "sleep 0.05; exit 0".to_string()],
+                Duration::from_secs(1),
+            )
+            .expect("spawn successful verifier"),
+        ];
+
+        assert_eq!(
+            wait_for_runtime_group(handles).await,
+            RuntimeGroupExecutionResult::Success
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_group_reports_failure_when_all_verifiers_fail() {
+        let handles = vec![
+            RuntimeVerificationHandle::spawn(
+                ProviderKind::Howdy,
+                "sh",
+                &["-c".to_string(), "exit 1".to_string()],
+                Duration::from_secs(1),
+            )
+            .expect("spawn first failing verifier"),
+            RuntimeVerificationHandle::spawn(
+                ProviderKind::Fprintd,
+                "sh",
+                &["-c".to_string(), "sleep 0.05; exit 1".to_string()],
+                Duration::from_secs(1),
+            )
+            .expect("spawn second failing verifier"),
+        ];
+
+        assert_eq!(
+            wait_for_runtime_group(handles).await,
+            RuntimeGroupExecutionResult::Failed(Vec::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_group_is_unavailable_when_no_backend_can_start() {
+        let result = verify_group_for_login(&["unknown".to_string()], "james").await;
+        match result {
+            RuntimeBiometricAttemptResult::Unavailable(message) => {
+                assert!(message.contains("Unsupported MyKey biometric backend"));
+            }
+            other => panic!("expected unavailable result, got {other:?}"),
+        }
     }
 }

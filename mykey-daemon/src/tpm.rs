@@ -137,6 +137,7 @@ pub fn unseal_key(credential_id_hex: &str) -> Result<Zeroizing<Vec<u8>>, String>
 // Path helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tpm2")]
 fn sealed_path(credential_id_hex: &str) -> PathBuf {
     Path::new(KEY_DIR).join(format!("{}.sealed", credential_id_hex))
 }
@@ -163,7 +164,7 @@ fn fallback_path(credential_id_hex: &str) -> PathBuf {
 pub fn seal_blob(data: &[u8]) -> Result<Vec<u8>, String> {
     use aes_gcm::{
         aead::{Aead, KeyInit},
-        Aes256Gcm, Key, Nonce,
+        Aes256Gcm, Nonce,
     };
     use rand::RngCore as _;
     use tpm2_impl::tpm_seal;
@@ -173,11 +174,13 @@ pub fn seal_blob(data: &[u8]) -> Result<Vec<u8>, String> {
     rand::rngs::OsRng.fill_bytes(&mut aes_key);
 
     // 2. Encrypt data with AES-256-GCM.
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
+    let cipher =
+        Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("AES-GCM key init: {e}"))?;
     let mut nonce_bytes = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), data)
+        .encrypt(&nonce, data)
         .map_err(|e| format!("AES-GCM encrypt: {e}"))?;
 
     // 3. TPM2-seal only the 32-byte AES key.
@@ -201,7 +204,7 @@ pub fn seal_blob(data: &[u8]) -> Result<Vec<u8>, String> {
 pub fn seal_blob(data: &[u8]) -> Result<Vec<u8>, String> {
     use aes_gcm::{
         aead::{Aead, KeyInit},
-        Aes256Gcm, Key, Nonce,
+        Aes256Gcm, Nonce,
     };
     use rand::RngCore as _;
 
@@ -216,11 +219,13 @@ pub fn seal_blob(data: &[u8]) -> Result<Vec<u8>, String> {
     rand::rngs::OsRng.fill_bytes(&mut aes_key);
 
     // 2. Encrypt data with AES-256-GCM.
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
+    let cipher =
+        Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("AES-GCM key init: {e}"))?;
     let mut nonce_bytes = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), data)
+        .encrypt(&nonce, data)
         .map_err(|e| format!("AES-GCM encrypt: {e}"))?;
 
     // 3. Pack blob: [4-byte sealed_key_len LE][raw aes_key][12-byte nonce][ciphertext]
@@ -243,7 +248,7 @@ pub fn seal_blob(data: &[u8]) -> Result<Vec<u8>, String> {
 pub fn unseal_blob(blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     use aes_gcm::{
         aead::{Aead, KeyInit},
-        Aes256Gcm, Key, Nonce,
+        Aes256Gcm, Nonce,
     };
     use tpm2_impl::tpm_unseal;
 
@@ -277,9 +282,11 @@ pub fn unseal_blob(blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     let aes_key = tpm_unseal(&pub_bytes, &priv_bytes)?;
 
     // 3. AES-256-GCM decrypt.
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&aes_key));
+    let cipher =
+        Aes256Gcm::new_from_slice(&aes_key).map_err(|e| format!("AES-GCM key init: {e}"))?;
+    let nonce = Nonce::clone_from_slice(nonce_bytes);
     let plaintext = cipher
-        .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|e| format!("AES-GCM decrypt: {e}"))?;
 
     Ok(Zeroizing::new(plaintext))
@@ -289,7 +296,7 @@ pub fn unseal_blob(blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
 pub fn unseal_blob(blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     use aes_gcm::{
         aead::{Aead, KeyInit},
-        Aes256Gcm, Key, Nonce,
+        Aes256Gcm, Nonce,
     };
 
     warn!("⚠ SOFTWARE FALLBACK (daemon): unseal_blob using software AES-GCM only.");
@@ -307,9 +314,14 @@ pub fn unseal_blob(blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
     let ciphertext = &blob[4 + sealed_key_len + 12..];
 
     // 2. AES-256-GCM decrypt.
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(aes_key));
+    let cipher =
+        Aes256Gcm::new_from_slice(aes_key).map_err(|e| format!("AES-GCM key init: {e}"))?;
+    let nonce_array: [u8; 12] = nonce_bytes
+        .try_into()
+        .map_err(|_| "AES-GCM decrypt: invalid nonce length".to_string())?;
+    let nonce = Nonce::from(nonce_array);
     let plaintext = cipher
-        .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|e| format!("AES-GCM decrypt: {e}"))?;
 
     Ok(Zeroizing::new(plaintext))

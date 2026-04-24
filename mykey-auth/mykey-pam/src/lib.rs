@@ -1,9 +1,10 @@
 // lib.rs — PAM module entry point for unified MyKey local authentication.
 //
-// Phase A:
-//   - this is the new top-level PAM entrypoint for MyKey
-//   - it still authenticates through the existing MyKey PIN backend
-//   - future phases will add biometric-first auth before PIN fallback
+// Runtime behavior:
+//   - this is the top-level PAM entrypoint for MyKey local auth
+//   - it asks the helper which runtime mode is active
+//   - it performs biometric-first auth when configured, then prompts for PIN fallback
+//   - it prompts for Linux password directly when MyKey-managed password fallback is active
 
 use pam::{export_pam_module, PamModule, PamReturnCode};
 use std::ffi::{CStr, CString};
@@ -20,6 +21,7 @@ mod pam_ffi {
 
     pub const PAM_PROMPT_ECHO_OFF: c_int = 1;
     pub const PAM_ERROR_MSG: c_int = 3;
+    pub const PAM_TEXT_INFO: c_int = 4;
     pub const PAM_CONV_ITEM: c_int = 5;
 
     #[repr(C)]
@@ -126,6 +128,10 @@ unsafe fn pam_converse(
     }
 }
 
+unsafe fn pam_message(handle: &pam::PamHandle, msg_style: libc::c_int, msg: &str) {
+    let _ = pam_converse(handle, msg_style, msg);
+}
+
 unsafe fn pam_user(handle: &pam::PamHandle) -> Option<String> {
     let mut user_ptr: *const libc::c_char = std::ptr::null();
     let rc = pam_ffi::pam_get_user(
@@ -173,32 +179,65 @@ fn user_to_uid(username: &str) -> Option<u32> {
 enum HelperAuthResult {
     Success,
     AuthFailed,
+    PinFallbackRequired(String),
     Locked(String),
     NotConfigured,
     Error(String),
 }
 
 enum HelperPreflightResult {
-    Ready,
+    Ready(HelperAuthMode),
     Ignore,
     Locked(String),
     Error(String),
 }
 
-fn run_auth_helper(uid: u32, pin: &[u8]) -> HelperAuthResult {
-    match run_helper_command(
-        &["authenticate", "--uid", &uid.to_string(), "--pin-stdin"],
-        Some(pin),
-    ) {
-        Ok((Some(0), _)) => HelperAuthResult::Success,
-        Ok((Some(1), _)) => HelperAuthResult::AuthFailed,
-        Ok((Some(3), stderr)) => HelperAuthResult::Locked(stderr),
-        Ok((Some(4), _)) => HelperAuthResult::NotConfigured,
-        Ok((Some(2), stderr)) => HelperAuthResult::Error(stderr),
-        Ok((Some(code), _)) => {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HelperAuthMode {
+    PinOnly,
+    PasswordFallback,
+    BiometricFirst { backends: Vec<String> },
+    SecurityKeyFirst,
+}
+
+enum HelperAuthInput<'a> {
+    None,
+    Pin(&'a [u8]),
+    Password(&'a [u8]),
+}
+
+fn run_auth_helper(uid: u32, input: HelperAuthInput<'_>) -> HelperAuthResult {
+    let uid_arg = uid.to_string();
+    let mut args = vec!["authenticate", "--uid", uid_arg.as_str()];
+    let stdin_data = match input {
+        HelperAuthInput::None => None,
+        HelperAuthInput::Pin(pin) => {
+            args.push("--pin-stdin");
+            Some(pin)
+        }
+        HelperAuthInput::Password(password) => {
+            args.push("--password-stdin");
+            Some(password)
+        }
+    };
+
+    match run_helper_command(&args, stdin_data) {
+        Ok((Some(0), _, _)) => HelperAuthResult::Success,
+        Ok((Some(1), _, _)) => HelperAuthResult::AuthFailed,
+        Ok((Some(3), _, stderr)) => HelperAuthResult::Locked(stderr),
+        Ok((Some(4), _, stderr)) => {
+            if stderr.is_empty() {
+                HelperAuthResult::NotConfigured
+            } else {
+                HelperAuthResult::Error(stderr)
+            }
+        }
+        Ok((Some(5), _, stderr)) => HelperAuthResult::PinFallbackRequired(stderr),
+        Ok((Some(2), _, stderr)) => HelperAuthResult::Error(stderr),
+        Ok((Some(code), _, _)) => {
             HelperAuthResult::Error(format!("mykey-auth exited unexpectedly with status {code}"))
         }
-        Ok((None, _)) => {
+        Ok((None, _, _)) => {
             HelperAuthResult::Error("mykey-auth terminated without an exit status".to_string())
         }
         Err(e) => HelperAuthResult::Error(e),
@@ -207,14 +246,17 @@ fn run_auth_helper(uid: u32, pin: &[u8]) -> HelperAuthResult {
 
 fn run_preflight_helper(uid: u32) -> HelperPreflightResult {
     match run_helper_command(&["preflight", "--uid", &uid.to_string()], None) {
-        Ok((Some(0), _)) => HelperPreflightResult::Ready,
-        Ok((Some(4), _)) => HelperPreflightResult::Ignore,
-        Ok((Some(3), stderr)) => HelperPreflightResult::Locked(stderr),
-        Ok((Some(2), stderr)) => HelperPreflightResult::Error(stderr),
-        Ok((Some(code), _)) => HelperPreflightResult::Error(format!(
+        Ok((Some(0), stdout, _)) => match parse_preflight_mode(&stdout) {
+            Ok(mode) => HelperPreflightResult::Ready(mode),
+            Err(e) => HelperPreflightResult::Error(e),
+        },
+        Ok((Some(4), _, _)) => HelperPreflightResult::Ignore,
+        Ok((Some(3), _, stderr)) => HelperPreflightResult::Locked(stderr),
+        Ok((Some(2), _, stderr)) => HelperPreflightResult::Error(stderr),
+        Ok((Some(code), _, _)) => HelperPreflightResult::Error(format!(
             "mykey-auth exited unexpectedly with status {code}"
         )),
-        Ok((None, _)) => {
+        Ok((None, _, _)) => {
             HelperPreflightResult::Error("mykey-auth terminated without an exit status".to_string())
         }
         Err(e) => HelperPreflightResult::Error(e),
@@ -224,7 +266,7 @@ fn run_preflight_helper(uid: u32) -> HelperPreflightResult {
 fn run_helper_command(
     args: &[&str],
     stdin_data: Option<&[u8]>,
-) -> Result<(Option<i32>, String), String> {
+) -> Result<(Option<i32>, String, String), String> {
     let helper_path = match resolve_auth_helper_path() {
         Some(path) => path,
         None => {
@@ -239,7 +281,7 @@ fn run_helper_command(
         } else {
             Stdio::null()
         })
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
     {
@@ -266,8 +308,55 @@ fn run_helper_command(
         Err(e) => return Err(format!("Failed waiting for mykey-auth: {e}")),
     };
 
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Ok((output.status.code(), stderr))
+    Ok((output.status.code(), stdout, stderr))
+}
+
+fn parse_preflight_mode(stdout: &str) -> Result<HelperAuthMode, String> {
+    let stdout = stdout.trim();
+    if stdout == "pin" {
+        return Ok(HelperAuthMode::PinOnly);
+    }
+    if stdout == "password" {
+        return Ok(HelperAuthMode::PasswordFallback);
+    }
+
+    if stdout.is_empty() {
+        return Err("mykey-auth preflight returned no runtime mode.".to_string());
+    }
+
+    if let Some(backend) = stdout.strip_prefix("biometric:") {
+        if backend.trim().is_empty() {
+            return Err("mykey-auth preflight did not specify a biometric backend.".to_string());
+        }
+        return Ok(HelperAuthMode::BiometricFirst {
+            backends: vec![backend.trim().to_string()],
+        });
+    }
+
+    if let Some(backends) = stdout.strip_prefix("biometric-group:") {
+        let parsed: Vec<String> = backends
+            .split(',')
+            .map(str::trim)
+            .filter(|backend| !backend.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        if parsed.is_empty() {
+            return Err(
+                "mykey-auth preflight did not specify any biometric backends.".to_string(),
+            );
+        }
+        return Ok(HelperAuthMode::BiometricFirst { backends: parsed });
+    }
+
+    if stdout == "security_key" {
+        return Ok(HelperAuthMode::SecurityKeyFirst);
+    }
+
+    Err(format!(
+        "mykey-auth preflight returned an unknown mode: {stdout}"
+    ))
 }
 
 fn resolve_auth_helper_path() -> Option<&'static str> {
@@ -278,7 +367,11 @@ fn resolve_auth_helper_path() -> Option<&'static str> {
 }
 
 unsafe fn pam_error(handle: &pam::PamHandle, msg: &str) {
-    let _ = pam_converse(handle, pam_ffi::PAM_ERROR_MSG, msg);
+    pam_message(handle, pam_ffi::PAM_ERROR_MSG, msg);
+}
+
+unsafe fn pam_info(handle: &pam::PamHandle, msg: &str) {
+    pam_message(handle, pam_ffi::PAM_TEXT_INFO, msg);
 }
 
 pub struct MyKeyModule;
@@ -308,8 +401,8 @@ impl PamModule for MyKeyModule {
             }
         };
 
-        match run_preflight_helper(uid) {
-            HelperPreflightResult::Ready => {}
+        let mode = match run_preflight_helper(uid) {
+            HelperPreflightResult::Ready(mode) => mode,
             HelperPreflightResult::Ignore => return PamReturnCode::Ignore,
             HelperPreflightResult::Locked(msg) | HelperPreflightResult::Error(msg) => {
                 unsafe {
@@ -324,24 +417,99 @@ impl PamModule for MyKeyModule {
                 }
                 return PamReturnCode::Auth_Err;
             }
-        }
+        };
 
-        let entered_pin = unsafe {
-            match pam_converse(handle, pam_ffi::PAM_PROMPT_ECHO_OFF, "MyKey PIN: ") {
-                Some(pin) => Zeroizing::new(pin),
-                None => return PamReturnCode::Auth_Err,
+        let first_result = match &mode {
+            HelperAuthMode::PinOnly => prompt_and_verify_pin(handle, uid, "MyKey PIN: "),
+            HelperAuthMode::PasswordFallback => {
+                prompt_and_verify_password(handle, uid, "Linux account password: ")
+            }
+            HelperAuthMode::BiometricFirst { backends } => {
+                if let Some(message) = biometric_prompt_message(backends) {
+                    unsafe {
+                        pam_info(handle, &message);
+                    }
+                }
+                run_auth_helper(uid, HelperAuthInput::None)
+            }
+            HelperAuthMode::SecurityKeyFirst => {
+                unsafe {
+                    pam_info(
+                        handle,
+                        "MyKey security-key verification in progress. Touch your enrolled key now.",
+                    );
+                }
+                run_auth_helper(uid, HelperAuthInput::None)
             }
         };
 
-        match run_auth_helper(uid, entered_pin.as_bytes()) {
+        match first_result {
             HelperAuthResult::Success => PamReturnCode::Success,
             HelperAuthResult::AuthFailed => {
                 unsafe {
-                    pam_error(handle, "Incorrect MyKey PIN.");
+                    pam_error(
+                        handle,
+                        match mode {
+                            HelperAuthMode::PinOnly => "Incorrect MyKey PIN.",
+                            HelperAuthMode::PasswordFallback => "Incorrect Linux account password.",
+                            HelperAuthMode::BiometricFirst { .. } => {
+                                "MyKey biometric authentication failed."
+                            }
+                            HelperAuthMode::SecurityKeyFirst => {
+                                "MyKey security-key authentication failed."
+                            }
+                        },
+                    );
                 }
                 PamReturnCode::Auth_Err
             }
-            HelperAuthResult::NotConfigured => PamReturnCode::Ignore,
+            HelperAuthResult::NotConfigured => {
+                unsafe {
+                    pam_error(handle, "MyKey authentication is not configured.");
+                }
+                PamReturnCode::Auth_Err
+            }
+            HelperAuthResult::PinFallbackRequired(msg) => {
+                if !msg.is_empty() {
+                    unsafe {
+                        pam_info(handle, &msg);
+                    }
+                }
+                match prompt_and_verify_pin(handle, uid, "MyKey PIN fallback: ") {
+                    HelperAuthResult::Success => PamReturnCode::Success,
+                    HelperAuthResult::AuthFailed => {
+                        unsafe {
+                            pam_error(handle, "Incorrect MyKey PIN.");
+                        }
+                        PamReturnCode::Auth_Err
+                    }
+                    HelperAuthResult::NotConfigured => {
+                        unsafe {
+                            pam_error(handle, "MyKey PIN fallback is not configured.");
+                        }
+                        PamReturnCode::Auth_Err
+                    }
+                    HelperAuthResult::PinFallbackRequired(_) => {
+                        unsafe {
+                            pam_error(handle, "MyKey PIN fallback did not complete.");
+                        }
+                        PamReturnCode::Auth_Err
+                    }
+                    HelperAuthResult::Locked(msg) | HelperAuthResult::Error(msg) => {
+                        unsafe {
+                            pam_error(
+                                handle,
+                                if msg.is_empty() {
+                                    "MyKey authentication failed."
+                                } else {
+                                    &msg
+                                },
+                            );
+                        }
+                        PamReturnCode::Auth_Err
+                    }
+                }
+            }
             HelperAuthResult::Locked(msg) | HelperAuthResult::Error(msg) => {
                 unsafe {
                     pam_error(
@@ -364,6 +532,117 @@ impl PamModule for MyKeyModule {
         _flags: c_uint,
     ) -> PamReturnCode {
         PamReturnCode::Success
+    }
+}
+
+fn prompt_and_verify_pin(handle: &pam::PamHandle, uid: u32, prompt: &str) -> HelperAuthResult {
+    let entered_pin = unsafe {
+        match pam_converse(handle, pam_ffi::PAM_PROMPT_ECHO_OFF, prompt) {
+            Some(pin) => Zeroizing::new(pin),
+            None => return HelperAuthResult::Error("Could not read the MyKey PIN.".to_string()),
+        }
+    };
+    run_auth_helper(uid, HelperAuthInput::Pin(entered_pin.as_bytes()))
+}
+
+fn prompt_and_verify_password(handle: &pam::PamHandle, uid: u32, prompt: &str) -> HelperAuthResult {
+    let entered_password = unsafe {
+        match pam_converse(handle, pam_ffi::PAM_PROMPT_ECHO_OFF, prompt) {
+            Some(password) => Zeroizing::new(password),
+            None => {
+                return HelperAuthResult::Error(
+                    "Could not read the Linux account password.".to_string(),
+                )
+            }
+        }
+    };
+    run_auth_helper(uid, HelperAuthInput::Password(entered_password.as_bytes()))
+}
+
+fn biometric_prompt_message(backends: &[String]) -> Option<String> {
+    match backends {
+        [backend] if backend == "fprintd" => Some(
+            "MyKey fingerprint verification in progress. Scan your enrolled finger now."
+                .to_string(),
+        ),
+        [backend] if backend == "howdy" => {
+            Some("MyKey face verification in progress. Look at the camera now.".to_string())
+        }
+        [] => None,
+        _ => Some(
+            "MyKey biometric verification in progress. Scan your enrolled finger or look at the camera now."
+                .to_string(),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{biometric_prompt_message, parse_preflight_mode, HelperAuthMode};
+
+    #[test]
+    fn parse_preflight_mode_accepts_pin() {
+        assert_eq!(
+            parse_preflight_mode("pin").expect("pin mode should parse"),
+            HelperAuthMode::PinOnly
+        );
+    }
+
+    #[test]
+    fn parse_preflight_mode_accepts_password() {
+        assert_eq!(
+            parse_preflight_mode("password").expect("password mode should parse"),
+            HelperAuthMode::PasswordFallback
+        );
+    }
+
+    #[test]
+    fn parse_preflight_mode_accepts_biometric_backend() {
+        assert_eq!(
+            parse_preflight_mode("biometric:fprintd").expect("biometric mode should parse"),
+            HelperAuthMode::BiometricFirst {
+                backends: vec!["fprintd".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_preflight_mode_accepts_biometric_group() {
+        assert_eq!(
+            parse_preflight_mode("biometric-group:fprintd,howdy")
+                .expect("biometric group mode should parse"),
+            HelperAuthMode::BiometricFirst {
+                backends: vec!["fprintd".to_string(), "howdy".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_preflight_mode_accepts_security_key() {
+        assert_eq!(
+            parse_preflight_mode("security_key").expect("security-key mode should parse"),
+            HelperAuthMode::SecurityKeyFirst
+        );
+    }
+
+    #[test]
+    fn biometric_prompt_message_matches_supported_backends() {
+        assert_eq!(
+            biometric_prompt_message(&["fprintd".to_string()]),
+            Some("MyKey fingerprint verification in progress. Scan your enrolled finger now.".to_string())
+        );
+        assert_eq!(
+            biometric_prompt_message(&["howdy".to_string()]),
+            Some("MyKey face verification in progress. Look at the camera now.".to_string())
+        );
+        assert_eq!(
+            biometric_prompt_message(&["fprintd".to_string(), "howdy".to_string()]),
+            Some(
+                "MyKey biometric verification in progress. Scan your enrolled finger or look at the camera now."
+                    .to_string()
+            )
+        );
+        assert_eq!(biometric_prompt_message(&[]), None);
     }
 }
 

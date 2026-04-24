@@ -28,4 +28,4 @@ SystemCallFilter=@system-service
 LimitMEMLOCK=65536
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

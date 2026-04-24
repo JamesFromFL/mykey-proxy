@@ -67,6 +67,17 @@ MyKey is made up of focused modules that work together.
 The local-auth pieces are now grouped under the `mykey-auth/` subtree so the
 repo layout stays readable as PIN, PAM, and biometric support grow.
 
+### 🧭 `mykey`
+The top-level terminal control surface.
+
+Use it first when you want to discover or route into the installed MyKey tools:
+
+- `mykey --help`
+- `mykey help auth`
+- `mykey status`
+- `mykey pin set`
+- `sudo mykey enable`
+
 ### ⚙️ `mykey-daemon`
 The security core of the project.
 
@@ -106,18 +117,37 @@ The long-term goal is a Windows Hello–style local authenticator for Linux:
 The local-auth subtree that groups MyKey’s system authentication pieces.
 
 It currently contains:
-- `mykey-pam` for the PAM-facing local auth layer
+- `mykey-pam` for the PAM-facing local auth layer and dedicated elevated-password verification
 - `mykey-pin` for PIN management and fallback auth
 - `mykey-biometrics` as the planned home for biometric setup and policy
+- `mykey-security-key` for security-key enrollment, status, test, and unenroll flows on top of `pamu2fcfg` and `pam_u2f`
 
 Current Phase A management commands:
+- `mykey --help` to discover installed modules and primary workflows
+- `sudo mykey-auth setup` to run the guided auth-first setup flow
 - `mykey-pin set` to configure the MyKey PIN policy
 - `sudo mykey-auth enable` to place MyKey first for supported elevation prompts and then optionally hand off to login setup
 - `sudo mykey-auth biometrics` to drive biometric enrollment, provider setup, and active backend selection
+- `sudo mykey-security-key enroll` to register a security key with a nickname and MyKey-owned metadata
+- `mykey-security-key test` to verify a registered key through the dedicated `pam_u2f` PAM service
 - `sudo mykey-auth login` to opt into MyKey-managed login and unlock PAM targets
 - `sudo mykey-auth disable` to remove the base MyKey-managed PAM entries and then walk login teardown
 - `sudo mykey-auth logout` to remove MyKey-managed login and unlock PAM targets
 - `mykey-auth status` to inspect local-auth policy plus base/login PAM integration state
+
+High-risk actions such as first PIN setup/reset and biometric management now
+verify the Linux account password through a dedicated MyKey PAM service instead
+of reusing the normal biometric path.
+
+Security-key enroll and unenroll use that same elevated-password path, but
+the security-key stage is now wired into `pam_mykey.so`, and the current staged
+runtime can preserve `biometric group -> security key -> pin`, with the
+biometric stage racing all configured providers on first success. Live hardware
+validation is still pending.
+
+If supported PAM targets are enabled before a MyKey PIN exists, MyKey currently
+uses the Linux account password as a MyKey-managed fallback until you run
+`mykey-pin set`.
 
 ### 🎛️ `mykey-manager`
 A planned GUI frontend for managing MyKey features from one place.
@@ -141,8 +171,9 @@ MyKey relies on a known-good boot chain. That is why Secure Boot, TPM measuremen
 Convenient daily authentication and elevated security actions are different categories.
 
 MyKey is moving toward this model:
-- 👆 normal local auth: biometrics or MyKey PIN
-- 🔐 elevated actions: stronger verification for setup, reset, and recovery flows
+- 👆 normal local auth: biometrics, security key, or MyKey PIN
+- 🔐 elevated actions: Linux account password through a dedicated password-only
+  PAM service for setup, reset, and recovery flows
 
 ---
 
@@ -192,6 +223,12 @@ The installer currently handles:
 - MyKey secret migration
 - final health checks
 
+After install, start with:
+
+```bash
+mykey --help
+```
+
 > ⚠️ The installer is still evolving. Expect some changes while the first release is being prepared.
 
 ---
@@ -217,7 +254,8 @@ Current real-world testing has focused on:
 ### 🔢 Local authentication
 - daemon-backed MyKey PIN flows
 - helper-backed PAM authentication
-- strong-auth gating for setup and reset actions
+- dedicated elevated-password gating for PIN setup/reset and biometric
+  management actions
 
 Testing coverage is improving, but this is still an active project and not a completed security product.
 

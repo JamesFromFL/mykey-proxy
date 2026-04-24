@@ -100,9 +100,4 @@ impl SessionStore {
             warn!("revoke_token called for unknown pid={}", pid);
         }
     }
-
-    /// Number of active sessions (for diagnostics).
-    pub async fn session_count(&self) -> usize {
-        self.tokens.read().await.len()
-    }
 }

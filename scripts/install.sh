@@ -426,19 +426,31 @@ echo " Phase 4 — Build and Install"
 echo "════════════════════════════════════════════════════════════"
 
 DAEMON_BINARY="mykey-daemon"
+MYKEY_BINARY="mykey"
 TRAY_BINARY="mykey-tray"
 SECRETS_BINARY="mykey-secrets"
 PIN_BINARY="mykey-pin"
 PIN_HELPER_BINARY="mykey-pin-auth"
 AUTH_BINARY="mykey-auth"
+ELEVATED_AUTH_HELPER_BINARY="mykey-elevated-auth"
+SECURITY_KEY_BINARY="mykey-security-key"
+SECURITY_KEY_AUTH_BINARY="mykey-security-key-auth"
 DAEMON_DEST="/usr/local/bin/${DAEMON_BINARY}"
+MYKEY_DEST="/usr/local/bin/${MYKEY_BINARY}"
 TRAY_DEST="/usr/local/bin/${TRAY_BINARY}"
 SECRETS_DEST="/usr/local/bin/${SECRETS_BINARY}"
 PIN_DEST="/usr/local/bin/mykey-pin"
 PIN_HELPER_DEST="/usr/local/bin/mykey-pin-auth"
 AUTH_DEST="/usr/local/bin/${AUTH_BINARY}"
+ELEVATED_AUTH_HELPER_DEST="/usr/local/bin/${ELEVATED_AUTH_HELPER_BINARY}"
+SECURITY_KEY_DEST="/usr/local/bin/${SECURITY_KEY_BINARY}"
+SECURITY_KEY_AUTH_DEST="/usr/local/bin/${SECURITY_KEY_AUTH_BINARY}"
 PIN_SO_DEST="/usr/lib/security/mykeypin.so"
 AUTH_SO_DEST="/usr/lib/security/pam_mykey.so"
+ELEVATED_AUTH_PAM_SERVICE_SRC="${REPO_ROOT}/scripts/mykey-elevated-auth.pam"
+ELEVATED_AUTH_PAM_SERVICE_DEST="/etc/pam.d/mykey-elevated-auth"
+SECURITY_KEY_PAM_SERVICE_SRC="${REPO_ROOT}/scripts/mykey-security-key-auth.pam"
+SECURITY_KEY_PAM_SERVICE_DEST="/etc/pam.d/mykey-security-key-auth"
 PIN_DIR="/etc/mykey/pin"
 LOCAL_AUTH_DIR="/etc/mykey/auth"
 SYSTEMD_UNIT_SRC="${REPO_ROOT}/scripts/mykey-daemon.service"
@@ -606,44 +618,88 @@ sudo install -m 0755 "${REPO_ROOT}/mykey-migrate/target/release/mykey-migrate" \
     "/usr/local/bin/mykey-migrate"
 ok "/usr/local/bin/mykey-migrate"
 
-# ── 4.21 Build mykey-pin ─────────────────────────────────────────────────
+# ── 4.21 Build mykey control surface ─────────────────────────────────────
+echo ""
+info "Building ${MYKEY_BINARY} (release)..."
+cd "${REPO_ROOT}/mykey"
+RUSTFLAGS="-A warnings" "${CARGO}" build --release
+ok "Build complete: ${MYKEY_BINARY}"
+
+# ── 4.22 Install mykey control surface ───────────────────────────────────
+sudo install -m 0755 "${REPO_ROOT}/mykey/target/release/${MYKEY_BINARY}" \
+    "${MYKEY_DEST}"
+ok "${MYKEY_DEST}"
+
+# ── 4.23 Build mykey-pin ─────────────────────────────────────────────────
 echo ""
 info "Building mykey-pin (release)..."
 cd "${REPO_ROOT}/mykey-auth/mykey-pin"
 RUSTFLAGS="-A warnings" "${CARGO}" build --release
 ok "Build complete: mykey-pin"
 
-# ── 4.22 Install mykey-pin binary ────────────────────────────────────────
+# ── 4.24 Install mykey-pin binary ────────────────────────────────────────
 sudo install -m 0755 "${REPO_ROOT}/mykey-auth/mykey-pin/target/release/mykey-pin" \
     "${PIN_DEST}"
 ok "${PIN_DEST}"
 
-# ── 4.23 Install mykey-pin-auth helper ────────────────────────────────────
+# ── 4.25 Install mykey-pin-auth helper ────────────────────────────────────
 sudo install -m 0755 "${REPO_ROOT}/mykey-auth/mykey-pin/target/release/${PIN_HELPER_BINARY}" \
     "${PIN_HELPER_DEST}"
 ok "${PIN_HELPER_DEST}"
 
-# ── 4.24 Install mykeypin.so PAM module ──────────────────────────────────
+# ── 4.26 Install mykeypin.so PAM module ──────────────────────────────────
 sudo install -m 0755 "${REPO_ROOT}/mykey-auth/mykey-pin/target/release/libmykeypin.so" \
     "${PIN_SO_DEST}"
 ok "${PIN_SO_DEST}"
 
-# ── 4.25 Build mykey-auth ────────────────────────────────────────────────
+# ── 4.27 Build mykey-auth ────────────────────────────────────────────────
 echo ""
 info "Building ${AUTH_BINARY} (release)..."
 cd "${REPO_ROOT}/mykey-auth/mykey-pam"
 RUSTFLAGS="-A warnings" "${CARGO}" build --release
 ok "Build complete: ${AUTH_BINARY}"
 
-# ── 4.26 Install mykey-auth binary ───────────────────────────────────────
+# ── 4.28 Install mykey-auth binary ───────────────────────────────────────
 sudo install -m 0755 "${REPO_ROOT}/mykey-auth/mykey-pam/target/release/${AUTH_BINARY}" \
     "${AUTH_DEST}"
 ok "${AUTH_DEST}"
 
-# ── 4.27 Install pam_mykey.so PAM module ─────────────────────────────────
+# ── 4.29 Install mykey-elevated-auth helper ──────────────────────────────
+sudo install -m 0755 "${REPO_ROOT}/mykey-auth/mykey-pam/target/release/${ELEVATED_AUTH_HELPER_BINARY}" \
+    "${ELEVATED_AUTH_HELPER_DEST}"
+ok "${ELEVATED_AUTH_HELPER_DEST}"
+
+# ── 4.30 Install pam_mykey.so PAM module ─────────────────────────────────
 sudo install -m 0755 "${REPO_ROOT}/mykey-auth/mykey-pam/target/release/libpam_mykey.so" \
     "${AUTH_SO_DEST}"
 ok "${AUTH_SO_DEST}"
+
+# ── 4.31 Install dedicated elevated-auth PAM service ─────────────────────
+sudo install -m 0644 "${ELEVATED_AUTH_PAM_SERVICE_SRC}" \
+    "${ELEVATED_AUTH_PAM_SERVICE_DEST}"
+ok "${ELEVATED_AUTH_PAM_SERVICE_DEST}"
+
+# ── 4.32 Build mykey-security-key ────────────────────────────────────────
+echo ""
+info "Building ${SECURITY_KEY_BINARY} (release)..."
+cd "${REPO_ROOT}/mykey-auth/mykey-security-key"
+RUSTFLAGS="-A warnings" "${CARGO}" build --release
+ok "Build complete: ${SECURITY_KEY_BINARY}"
+
+# ── 4.33 Install mykey-security-key binary ───────────────────────────────
+sudo install -m 0755 "${REPO_ROOT}/mykey-auth/mykey-security-key/target/release/${SECURITY_KEY_BINARY}" \
+    "${SECURITY_KEY_DEST}"
+ok "${SECURITY_KEY_DEST}"
+
+# ── 4.34 Install mykey-security-key-auth helper ──────────────────────────
+sudo install -m 0755 "${REPO_ROOT}/mykey-auth/mykey-security-key/target/release/${SECURITY_KEY_AUTH_BINARY}" \
+    "${SECURITY_KEY_AUTH_DEST}"
+ok "${SECURITY_KEY_AUTH_DEST}"
+
+# ── 4.35 Install dedicated security-key PAM service ──────────────────────
+sudo install -m 0644 "${SECURITY_KEY_PAM_SERVICE_SRC}" \
+    "${SECURITY_KEY_PAM_SERVICE_DEST}"
+ok "${SECURITY_KEY_PAM_SERVICE_DEST}"
 
 # Update binary hashes after installation
 echo ""
@@ -711,7 +767,7 @@ fi
 
 # [3/8] Binaries
 echo "[3/8] Binaries..."
-for bin in "${DAEMON_BINARY}" "${TRAY_BINARY}" "${SECRETS_BINARY}" "mykey-migrate" "${PIN_BINARY}" "${PIN_HELPER_BINARY}" "${AUTH_BINARY}"; do
+for bin in "${DAEMON_BINARY}" "${MYKEY_BINARY}" "${TRAY_BINARY}" "${SECRETS_BINARY}" "mykey-migrate" "${PIN_BINARY}" "${PIN_HELPER_BINARY}" "${AUTH_BINARY}" "${ELEVATED_AUTH_HELPER_BINARY}" "${SECURITY_KEY_BINARY}" "${SECURITY_KEY_AUTH_BINARY}"; do
     if [[ -x "/usr/local/bin/${bin}" ]]; then
         ok "/usr/local/bin/${bin}"
     else
@@ -727,7 +783,9 @@ for f in \
     "${POLKIT_POLICY}" \
     "/etc/dbus-1/system.d/com.mykey.Daemon.conf" \
     "${PIN_SO_DEST}" \
-    "${AUTH_SO_DEST}"
+    "${AUTH_SO_DEST}" \
+    "${ELEVATED_AUTH_PAM_SERVICE_DEST}" \
+    "${SECURITY_KEY_PAM_SERVICE_DEST}"
 do
     if sudo test -f "${f}"; then
         ok "${f}"
@@ -801,10 +859,12 @@ if [[ "${FAILED}" -eq 0 ]]; then
     echo " Installation complete — all checks passed."
     echo ""
     echo " Next validation steps:"
-    echo "   1. Verify PIN status with: mykey-pin status"
-    echo "   2. Verify Secret Service with: systemctl --user status mykey-secrets"
-    echo "   3. Optional tray: mykey-tray enable"
-    echo "   4. Verify tray status with: mykey-tray status"
+    echo "   1. Start with: mykey --help"
+    echo "   2. Verify auth status with: mykey status"
+    echo "   3. Verify PIN status with: mykey pin status"
+    echo "   4. Verify Secret Service with: systemctl --user status mykey-secrets"
+    echo "   5. Optional tray: mykey tray enable"
+    echo "   6. Verify tray status with: mykey tray status"
     echo ""
     echo " Live logs:"
     echo "   journalctl -u mykey-daemon -f"

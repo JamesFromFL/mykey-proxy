@@ -9,6 +9,7 @@ plans or future ideas.
 This threat model covers:
 
 - `mykey-daemon` as the privileged system trust anchor
+- `mykey` as the top-level terminal routing surface
 - `mykey-auth` and `pam_mykey.so` as the local-auth entrypoint
 - `mykey-secrets` as the user-session Secret Service provider
 - `mykey-migrate` as the explicit provider handoff tool
@@ -16,8 +17,8 @@ This threat model covers:
   posture
 
 This threat model does not cover the removed browser extension / native host
-architecture, and it does not describe unimplemented security-key or passkey
-runtime support as if those paths already exist.
+architecture, and it does not describe unimplemented passkey support as if
+those paths already exist.
 
 ## Security Objectives
 
@@ -93,6 +94,19 @@ Why this matters:
 This is how MyKey keeps privileged auth state out of random user-session
 processes.
 
+### Top-level CLI routing
+
+MyKey now has a thin top-level `mykey` command.
+
+Why this matters:
+
+- it is the primary operator-facing discovery surface for installed MyKey tools
+- it routes to the real component binaries instead of implementing privileged
+  behavior itself
+- it does not widen the daemon trust boundary on its own; the security
+  boundary remains with the routed binaries and the daemon APIs they already
+  use
+
 ### PAM and polkit
 
 MyKey depends on PAM and polkit because it is deliberately integrating with the
@@ -101,9 +115,14 @@ system's local-auth model instead of trying to replace the whole thing.
 Why this matters:
 
 - PAM lets MyKey enter supported local-auth flows while still falling through
-  safely when MyKey is absent or unconfigured
-- polkit gives MyKey an existing path for stronger confirmation on management
-  actions such as first-time setup or reset operations
+  safely when MyKey is absent or intentionally disabled at the PAM layer
+- once MyKey is active for a supported target, normal Linux password fallback
+  can stay inside MyKey instead of dropping through to downstream PAM modules
+- PAM also gives MyKey a narrow dedicated password-only service for elevated
+  management actions such as first-time PIN setup/reset and biometric changes
+- polkit still matters for supported system auth surfaces such as `polkit-1`,
+  but elevated MyKey management no longer depends on the broad generic polkit
+  confirmation path
 - using these native OS boundaries is more defensible than inventing a second
   parallel auth stack for everything
 
@@ -226,8 +245,10 @@ logic or secret-state handling directly in the PAM host process.
 The intended security property here is:
 
 - if MyKey is configured and succeeds, it should authenticate first
-- if MyKey is absent, unconfigured, or intentionally disabled, PAM should fall
-  through to the next method cleanly
+- if no MyKey PIN is configured yet, normal Linux password fallback should
+  still be mediated by MyKey instead of bypassing it
+- if MyKey is absent or intentionally disabled, PAM should fall through to the
+  next method cleanly
 
 ### User-session Secret Service boundary
 
@@ -271,10 +292,10 @@ Those should not be implicit package-manager side effects.
 | Boundary | Primary mechanism | Why it exists |
 |---|---|---|
 | local process -> `mykey-daemon` | D-Bus sender PID/UID checks plus trusted-caller restrictions | keep privileged daemon APIs from being callable by arbitrary local processes |
-| PAM consumer -> `pam_mykey.so` -> `mykey-auth` | thin PAM module plus helper indirection | keep high-trust logic out of the PAM host process while preserving fail-through behavior |
+| PAM consumer -> `pam_mykey.so` -> `mykey-auth` | thin PAM module plus helper indirection | keep high-trust logic out of the PAM host process while preserving safe fallback only when MyKey is absent or intentionally disabled |
 | user session -> `mykey-secrets` | private user data dir plus sealed secret payloads | let MyKey act as a session provider without pretending the whole user session is a privileged boundary |
 | provider switch -> `mykey-migrate` | explicit enroll / unenroll ownership | prevent package install or removal from silently taking over or breaking Secret Service ownership |
-| package install -> runtime setup | package payload vs setup-command split | keep destructive or stateful transitions out of package-manager side effects |
+| package install -> runtime setup | package payload vs setup-command split, with daemon bring-up as the only intended install-time side effect | keep destructive or high-risk transitions out of package-manager side effects while still leaving the auth backend ready for immediate setup |
 
 ## Threats And Current Mitigations
 
@@ -331,7 +352,9 @@ Current mitigations:
   PAM files
 - base auth targets and login targets are handled separately
 - login takeover is explicit and opt-in
-- `pam_mykey.so` uses fail-through behavior through `PAM_IGNORE`
+- `pam_mykey.so` only uses `PAM_IGNORE` for safe absence / disabled cases; when
+  normal password fallback is allowed, it stays on a MyKey-managed password
+  path instead of falling through to downstream password modules
 - MyKey-managed PAM entries can be written with a leading `-auth` style entry
   so a missing module file does not become a hard failure
 
@@ -392,13 +415,26 @@ Current mitigations:
 
 - daemon-owned local-auth policy is normalized on read
 - biometric policy without a PIN fallback is sanitized back to a safe state
+- the daemon computes effective policy outputs from live state, so missing-PIN
+  or contradictory policy combinations are collapsed back to safe behavior
+- daemon-owned effective policy now exposes an ordered auth chain plus active
+  biometric backends instead of a single `primary_method`
+- effective policy now explicitly distinguishes when normal password fallback is
+  allowed, when elevated MyKey actions still require password, and what the
+  biometric attempt ceiling is
+- biometric runtime verification now runs under explicit timeout/cancellation
+  control so a stalled provider cannot hold the MyKey chain open indefinitely
 - biometric setup is explicitly tied to MyKey policy management instead of
   hand-edited PAM changes
+- elevated MyKey actions now go through a dedicated password-only PAM service
+  instead of inheriting fingerprint or other broad shared PAM stacks
 
 Residual risk:
 
-- biometric runtime auth is not yet the primary live PAM backend
-- security-key auth is planned but not implemented
+- biometric runtime auth now exists, but its host-installed behavior still
+  needs calibration across the supported PAM surfaces MyKey manages
+- security-key runtime auth now exists, but it still needs real hardware
+  validation and broad host-installed calibration
 
 ### Over-broad package or setup behavior
 
@@ -432,9 +468,11 @@ concerns:
 - legacy browser-facing request methods and browser caller validation still
   exist in the daemon even though the browser bridge has been removed from
   release scope
-- biometrics have setup and policy scaffolding, but runtime PAM auth remains
-  effectively PIN-backed today
-- security-key auth is not implemented yet
+- biometric runtime auth now shells out to upstream provider verification
+  commands and still needs broad host-installed calibration, especially across
+  display-manager and login-adjacent PAM surfaces
+- security-key runtime auth now shells out through a dedicated `pam_u2f` helper
+  path and still needs real-key validation on supported hosts
 - package-safe install/remove behavior and provider teardown messaging are still
   being tightened
 

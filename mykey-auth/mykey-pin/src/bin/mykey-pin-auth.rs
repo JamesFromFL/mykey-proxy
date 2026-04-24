@@ -4,7 +4,7 @@
 // can call into mykey-daemon through a trusted MyKey executable rather than
 // from host processes such as sudo, login, or a display manager.
 
-#[path = "../daemon_client.rs"]
+#[path = "../auth_daemon_client.rs"]
 mod daemon_client;
 
 use std::io::Read;

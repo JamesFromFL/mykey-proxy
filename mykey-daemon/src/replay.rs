@@ -113,11 +113,6 @@ impl ReplayCache {
         self.seen
             .retain(|_seq, recorded_at| now.saturating_sub(*recorded_at) <= self.window_seconds);
     }
-
-    /// Count of currently tracked sequence numbers (for diagnostics).
-    pub fn len(&self) -> usize {
-        self.seen.len()
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -72,11 +72,14 @@ Today it includes:
 - `mykey-pam`
   - `pam_mykey.so`
   - `mykey-auth`
+  - `mykey-elevated-auth`
   - PAM target inspection and managed PAM edits
 - `mykey-pin`
   - PIN setup, reset, verify, and status workflows
 - biometric setup scaffolding in `mykey-auth biometrics`
-- planned `mykey-security-key`
+- `mykey-security-key`
+  - security-key enrollment, status, test, and unenroll on top of `pamu2fcfg`
+    and `pam_u2f`
 
 This layer is responsible for connecting PAM-facing system behavior to the
 daemon-owned auth model without putting high-trust logic directly in the PAM
@@ -104,8 +107,12 @@ because the package is installed.
 
 The session UX layer is currently small:
 
+- `mykey`
 - `mykey-tray`
 - `mykey-manager` placeholder code
+
+`mykey` is now the primary terminal control surface. It is intentionally thin
+and routes into the underlying component binaries instead of replacing them.
 
 `mykey-tray` is optional and intentionally minimal. It exists to show status
 and later surface small notifications such as login-manager detection.
@@ -131,10 +138,71 @@ Local PAM consumer
 Important current reality:
 
 - `pam_mykey.so` is the intended long-term local-auth entrypoint
-- the active runtime backend today is still effectively MyKey PIN
-- biometric setup and policy scaffolding exist, but full biometric-first PAM
-  execution is not complete yet
-- security-key auth is not implemented yet
+- runtime auth now follows daemon local-auth policy instead of hardcoding PIN-only behavior
+- when no MyKey PIN is configured, `pam_mykey.so` now keeps normal Linux
+  password fallback inside MyKey through `mykey-auth`, the password-only PAM
+  service, and daemon-owned backoff state
+- when biometric-first policy is active, `mykey-auth` now drives up to the
+  daemon-configured biometric attempt limit through the selected `fprintd` or
+  `Howdy` backend before falling back to MyKey PIN
+- when security-key-first policy is active, `mykey-auth` now drives the
+  dedicated `mykey-security-key-auth` / `pam_u2f` path before falling back to
+  MyKey PIN
+- the daemon now computes effective local-auth policy outputs such as password
+  fallback allowance, elevated-action password requirements, and biometric
+  attempt limits instead of exposing only raw stored settings
+- broad host-installed calibration of biometric-first PAM behavior is still
+  pending
+- security-key runtime auth is now wired, but still needs real hardware
+  validation on a host with `pam_u2f`
+
+### Elevated management auth path
+
+```text
+Local MyKey frontend (`mykey-pin`, `mykey-auth biometrics`, `mykey-security-key`)
+    └── mykey-elevated-auth
+         └── PAM service: mykey-elevated-auth (password-only)
+              └── mykey-daemon (system service)
+                   ├── elevated-auth rate limit state
+                   └── purpose-scoped grants for PIN enroll/reset, biometric management, and security-key management
+```
+
+Important current reality:
+
+- this path is separate from normal `pam_mykey.so` runtime auth
+- it exists so elevated MyKey actions do not inherit fingerprint, `Howdy`, or
+  other broad shared PAM stacks by accident
+- it currently gates first-time PIN setup, PIN reset, biometric management, and
+  security-key enroll/unenroll
+
+### Security-key management and runtime path
+
+```text
+mykey-security-key
+    ├── enroll / unenroll
+    │    ├── mykey-elevated-auth
+    │    ├── pamu2fcfg
+    │    ├── mykey-daemon SealSecret/UnsealSecret
+    │    ├── mykey-daemon local-auth policy
+    │    └── /etc/mykey/security-keys.pam_u2f
+    └── test
+         └── PAM service: mykey-security-key-auth
+              └── pam_u2f.so
+
+Local PAM consumer
+    └── pam_mykey.so
+         └── mykey-auth
+              └── mykey-security-key-auth
+                   └── PAM service: mykey-security-key-auth
+                        └── pam_u2f.so
+```
+
+Important current reality:
+
+- MyKey owns the metadata registry and the shared `pam_u2f` authfile
+- the runtime verifier is still the existing system `pam_u2f` stack
+- security-key-first runtime auth now exists through `pam_mykey.so`
+- real hardware validation of that runtime path is still pending
 
 ### Secret Service path
 
@@ -176,18 +244,22 @@ The intended first-time auth path is:
 
 ```text
 package install
-    -> enable mykey-daemon
-    -> configure mykey-pin
-    -> run mykey-auth enable
-    -> optionally run mykey-auth login
-    -> optionally enroll biometrics
+    -> mykey-daemon already active
+    -> run mykey-auth setup
+    -> optionally run mykey-migrate --enroll
 ```
 
 Important design rule:
 
-- `mykey-auth enable` is for base auth targets such as `sudo` and `polkit-1`
-- `mykey-auth login` is a separate explicit step so MyKey never silently takes
-  over desktop login or unlock
+- `mykey-auth setup` owns the auth-first operator flow:
+  - PIN first
+  - optional security key when PIN exists
+  - optional biometrics when PIN exists
+  - required base PAM takeover
+  - optional login/unlock takeover
+- `mykey-auth enable` remains the lower-level base-target command for `sudo`
+  and `polkit-1`
+- login takeover remains explicit and opt-in even when driven from setup
 
 ### Secret Service takeover
 
@@ -311,8 +383,8 @@ It should not be treated as a real architectural control plane yet.
 | `mykey-secrets` | user service | Secret Service provider | `mykey-migrate --enroll` |
 | `mykey-tray` | user service | optional status surface | `mykey-tray enable` |
 
-`mykey-auth`, `mykey-pin`, and `mykey-migrate` are command surfaces, not
-long-running services.
+`mykey`, `mykey-auth`, `mykey-pin`, and `mykey-migrate` are command surfaces,
+not long-running services.
 
 ## Quick Reference
 
@@ -321,6 +393,7 @@ long-running services.
 | local-auth policy | `mykey-daemon` | per-user policy under `/etc/mykey/auth/<uid>/` |
 | PIN state and lockout | `mykey-daemon` | per-user state under `/etc/mykey/pin/<uid>/` |
 | PAM target management | `mykey-auth` | writes explicit MyKey-managed blocks in `/etc/pam.d` |
+| top-level terminal UX | `mykey` | thin routing and help surface over the installed MyKey binaries |
 | Secret Service bus ownership | `mykey-migrate` + `mykey-secrets` | migration decides when takeover happens; provider owns the bus only when enrolled |
 | session status UX | `mykey-tray` | optional, non-authoritative, daemon-coupled |
 | future GUI orchestration | `mykey-manager` | not a real control plane yet |
@@ -391,22 +464,37 @@ The current local-auth model is narrower than the final intended design.
 
 What is live today:
 
-- MyKey PIN is the active runtime backend behind `pam_mykey.so`
+- `pam_mykey.so` now uses daemon policy to choose between MyKey-managed Linux
+  password fallback and an ordered local-auth chain
 - daemon-owned local-auth policy exists
 - biometric setup and backend selection scaffolding exist
+- staged local-auth policy now represents biometrics, security key, and PIN as
+  one coherent chain instead of one `primary_method`
+- the current runtime can drive `biometric group -> security key -> pin`, with
+  the biometric stage racing all configured providers and accepting first
+  success
+- the biometric verifier layer now runs upstream provider checks under explicit
+  timeout/cancellation control so a stalled provider cannot block the MyKey
+  chain indefinitely
 - MyKey-managed PAM placement exists
+- elevated MyKey management actions use a dedicated password-only PAM service through `mykey-elevated-auth`
+- security-key management and live runtime flows now exist through
+  `mykey-security-key`, `mykey-auth`, and a dedicated `pam_u2f` PAM service
 
 What is not complete yet:
 
-- full biometric-first PAM auth execution
-- security-key auth
-- final backend-first orchestration across PIN, biometrics, and security keys
+- live hardware security-key validation
+- broad host-installed validation of biometric-first behavior across supported
+  PAM surfaces
 
 So the current architecture should be read as:
 
-- PIN-backed local auth is real
-- biometrics are partially implemented
-- security keys are planned only
+- daemon-owned staged local auth is real
+- biometrics now participate in the live `pam_mykey.so` runtime path, including
+  the multi-provider first-success stage, but the host-validation story is
+  still incomplete
+- security keys now participate in the live `pam_mykey.so` runtime path, but
+  still need hardware validation and broader host-installed calibration
 
 ## Secret Service Model
 
@@ -446,11 +534,9 @@ That means the intended operator flow is increasingly:
 
 ```text
 package install
-    -> enable mykey-daemon
-    -> run mykey-migrate --enroll
-    -> configure mykey-pin
-    -> run mykey-auth enable
-    -> optionally run mykey-auth login
+    -> mykey-daemon auto-started by package install
+    -> run mykey-auth setup
+    -> optionally run mykey-migrate --enroll
     -> optionally enable mykey-tray
 ```
 
@@ -464,8 +550,8 @@ The current architecture still contains some transitional elements:
   removed
 - the package and uninstall behavior is still being tightened around migration
   safety and user-state preservation
-- biometric support is ahead in setup and policy, but behind in live PAM auth
-  execution
+- biometric runtime now exists, but broader host-installed calibration is still
+  pending
 
 These are part of the current architecture picture and should not be ignored
 when evaluating the system.

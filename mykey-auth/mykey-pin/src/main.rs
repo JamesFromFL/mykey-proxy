@@ -6,9 +6,18 @@
 //   mykey-pin reset    Reset PIN using your Linux password
 //   mykey-pin status   Show PIN and lockout status
 
+#[path = "cli_daemon_client.rs"]
 mod daemon_client;
 
+use std::io::Write;
+use std::process::{Command, Stdio};
+
 use zeroize::Zeroizing;
+
+const ELEVATED_AUTH_HELPER_CANDIDATES: &[&str] = &[
+    "/usr/local/bin/mykey-elevated-auth",
+    "/usr/bin/mykey-elevated-auth",
+];
 
 #[tokio::main]
 async fn main() {
@@ -64,11 +73,11 @@ async fn run_set() {
     if status.is_set {
         set_existing_pin(&client, uid).await;
     } else {
-        require_strong_auth(
-            &client,
-            "First-time PIN enrollment requires verifying your Linux password or fingerprint.",
-        )
-        .await;
+        require_elevated_password(
+            uid,
+            "pin_enroll",
+            "First-time PIN enrollment requires verifying your Linux account password.",
+        );
         enroll_new_pin(&client, uid).await;
     }
 
@@ -108,11 +117,11 @@ async fn run_change() {
 async fn run_reset() {
     let uid = current_uid();
     let client = connect_client().await;
-    require_strong_auth(
-        &client,
-        "Resetting PIN requires verifying your Linux password or fingerprint.",
-    )
-    .await;
+    require_elevated_password(
+        uid,
+        "pin_reset",
+        "Resetting PIN requires verifying your Linux account password.",
+    );
 
     if let Err(e) = client.pin_reset(uid).await {
         client.disconnect().await;
@@ -167,26 +176,42 @@ async fn connect_client() -> daemon_client::DaemonClient {
     }
 }
 
-async fn require_strong_auth(
-    client: &daemon_client::DaemonClient,
-    intro: &str,
-) {
+fn require_elevated_password(uid: u32, purpose: &str, intro: &str) {
     println!("{intro}");
-    match client.confirm_user_presence().await {
-        Ok(true) => {}
-        Ok(false) => {
-            eprintln!("Authentication failed.");
+    let password = match prompt_linux_password("Linux account password: ") {
+        Some(password) => password,
+        None => {
+            eprintln!("Failed to read Linux password.");
             std::process::exit(1);
         }
-        Err(e) => {
-            eprintln!("Could not verify your identity: {e}");
+    };
+
+    match run_elevated_auth_helper(uid, purpose, password.as_bytes()) {
+        HelperAuthResult::Success => {}
+        HelperAuthResult::AuthFailed(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+        HelperAuthResult::RateLimited(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+        HelperAuthResult::Error(message) => {
+            eprintln!("{message}");
             std::process::exit(1);
         }
     }
 }
 
 fn current_uid() -> u32 {
-    unsafe { libc::geteuid() as u32 }
+    if unsafe { libc::geteuid() } == 0 {
+        std::env::var("SUDO_UID")
+            .ok()
+            .and_then(|uid| uid.parse::<u32>().ok())
+            .unwrap_or_else(|| unsafe { libc::getuid() })
+    } else {
+        unsafe { libc::getuid() }
+    }
 }
 
 async fn enroll_new_pin(client: &daemon_client::DaemonClient, uid: u32) {
@@ -279,6 +304,102 @@ fn prompt_pin(prompt: &str) -> Option<Zeroizing<String>> {
     rpassword::prompt_password(prompt).ok().map(Zeroizing::new)
 }
 
+fn prompt_linux_password(prompt: &str) -> Option<Zeroizing<String>> {
+    rpassword::prompt_password(prompt).ok().map(Zeroizing::new)
+}
+
+enum HelperAuthResult {
+    Success,
+    AuthFailed(String),
+    RateLimited(String),
+    Error(String),
+}
+
+fn run_elevated_auth_helper(uid: u32, purpose: &str, password: &[u8]) -> HelperAuthResult {
+    let helper_path = match resolve_elevated_auth_helper_path() {
+        Some(path) => path,
+        None => {
+            return HelperAuthResult::Error(
+                "Could not find an installed mykey-elevated-auth helper.".to_string(),
+            );
+        }
+    };
+
+    let mut child = match Command::new(helper_path)
+        .args(["verify", "--uid", &uid.to_string(), "--purpose", purpose])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return HelperAuthResult::Error(format!("Could not launch mykey-elevated-auth: {e}"));
+        }
+    };
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        if let Err(e) = stdin.write_all(password) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return HelperAuthResult::Error(format!(
+                "Could not send password to mykey-elevated-auth: {e}"
+            ));
+        }
+    } else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return HelperAuthResult::Error(
+            "mykey-elevated-auth did not expose a writable stdin".to_string(),
+        );
+    }
+
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(e) => {
+            return HelperAuthResult::Error(format!("Failed waiting for mykey-elevated-auth: {e}"));
+        }
+    };
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match output.status.code() {
+        Some(0) => HelperAuthResult::Success,
+        Some(1) => HelperAuthResult::AuthFailed(non_empty_message(
+            stderr,
+            "Linux password verification failed.",
+        )),
+        Some(3) => HelperAuthResult::RateLimited(non_empty_message(
+            stderr,
+            "Elevated MyKey password auth is temporarily rate-limited.",
+        )),
+        Some(2) => HelperAuthResult::Error(non_empty_message(
+            stderr,
+            "Elevated MyKey password verification failed.",
+        )),
+        Some(code) => HelperAuthResult::Error(format!(
+            "mykey-elevated-auth exited unexpectedly with status {code}"
+        )),
+        None => HelperAuthResult::Error(
+            "mykey-elevated-auth terminated without an exit status".to_string(),
+        ),
+    }
+}
+
+fn resolve_elevated_auth_helper_path() -> Option<&'static str> {
+    ELEVATED_AUTH_HELPER_CANDIDATES
+        .iter()
+        .copied()
+        .find(|path| std::path::Path::new(path).is_file())
+}
+
+fn non_empty_message(message: String, fallback: &str) -> String {
+    if message.is_empty() {
+        fallback.to_string()
+    } else {
+        message
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::validate_new_pin;
@@ -292,7 +413,10 @@ mod tests {
     #[test]
     fn pin_policy_rejects_short_long_or_non_numeric_values() {
         assert_eq!(validate_new_pin(""), Err("PIN must be at least 4 digits."));
-        assert_eq!(validate_new_pin("123"), Err("PIN must be at least 4 digits."));
+        assert_eq!(
+            validate_new_pin("123"),
+            Err("PIN must be at least 4 digits.")
+        );
         assert_eq!(
             validate_new_pin("1234567890123"),
             Err("PIN must be no more than 12 digits.")

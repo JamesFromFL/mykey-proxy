@@ -1,0 +1,8 @@
+#%PAM-1.0
+#
+# Dedicated password-only PAM service for elevated MyKey actions.
+# Keep this path narrow. Do not route it through system-auth, system-login,
+# system-local-login, pam_mykey, fingerprint, face, or any other biometric
+# or broad shared PAM stack.
+auth       required   pam_unix.so try_first_pass
+account    required   pam_unix.so

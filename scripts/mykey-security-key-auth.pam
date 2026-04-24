@@ -1,0 +1,8 @@
+#%PAM-1.0
+#
+# Dedicated PAM service for MyKey security-key authentication.
+# This service is intentionally narrow and uses pam_u2f with a MyKey-owned
+# authfile instead of inheriting broad shared PAM stacks.
+auth       sufficient pam_u2f.so authfile=/etc/mykey/security-keys.pam_u2f origin=pam://mykey appid=pam://mykey cue
+auth       required   pam_deny.so
+account    required   pam_permit.so

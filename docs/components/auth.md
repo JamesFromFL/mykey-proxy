@@ -8,21 +8,23 @@ Today that means:
 
 - PAM integration
 - MyKey PIN setup and verification
-- biometric enrollment scaffolding
-- planned security-key support
+- guided auth-first setup
+- biometric enrollment and runtime orchestration
+- security-key management and runtime support
 
 ## Current Subtree
 
 - `mykey-pam`
   - `pam_mykey.so`
   - `mykey-auth`
+  - `mykey-elevated-auth`
   - PAM target inspection and managed edits
 - `mykey-pin`
   - PIN setup, reset, and status helpers
 - `mykey-biometrics`
   - planned backend-specific biometric tooling
 - `mykey-security-key`
-  - planned security-key/FIDO2 helper area
+  - security-key/FIDO2 enrollment, status, test, and unenroll helper area
 
 ## PAM Management Model
 
@@ -54,25 +56,68 @@ login or unlock behavior.
 
 ## Current Runtime Auth Behavior
 
-The current runtime backend behind `pam_mykey.so` is still the MyKey PIN.
+The runtime path behind `pam_mykey.so` is now daemon-policy-driven.
 
 Important nuance:
 
+- when no MyKey PIN is configured, supported PAM prompts now use a MyKey-managed
+  Linux password fallback path instead of dropping through to downstream PAM
+  password modules
+- PIN-only auth still works as the simplest MyKey local-auth mode
 - biometric setup exists
 - biometric backend selection exists
-- daemon-owned biometric policy exists
-- PAM auth itself still rejects non-PIN runtime backends today
+- daemon-owned staged local-auth policy exists
+- when biometric-first policy is active, `mykey-auth` now drives the selected
+  upstream backend for up to the daemon-configured biometric attempt limit
+  before falling back to MyKey PIN
+- those upstream biometric checks now run under explicit MyKey timeout and
+  cancellation control
+- when security-key-first policy is active, `mykey-auth` now drives the
+  dedicated `mykey-security-key-auth` / `pam_u2f` path before falling back to
+  MyKey PIN
+- the current runtime now preserves `biometric group -> security key -> pin`,
+  with the biometric stage racing all configured providers and accepting the
+  first success
+- biometric failures do not touch the MyKey PIN lockout counter unless PIN
+  fallback is actually attempted
+- security-key failures follow the same rule and do not touch the MyKey PIN
+  lockout counter unless PIN fallback is actually attempted
 
-So “biometrics support” currently means setup and policy scaffolding, not full
-biometric-first PAM auth execution yet.
+So “biometrics support” now means setup, policy, and a first live
+biometric-first PAM runtime path, not just scaffolding.
+
+## Elevated Management Auth
+
+High-risk MyKey management actions are intentionally separate from normal
+`pam_mykey.so` runtime auth.
+
+Today that means:
+
+- first-time PIN setup and PIN reset use `mykey-elevated-auth`
+- biometric enroll, unenroll, and policy-changing actions use the same helper
+- security-key enroll and unenroll use the same helper
+- the helper authenticates through a dedicated `mykey-elevated-auth` PAM
+  service that is meant to stay password-only
+- that service should not point at `system-auth`, `system-local-login`,
+  fingerprint, `Howdy`, or `pam_mykey.so`
 
 ## `mykey-auth` Commands
+
+### `mykey-auth setup`
+
+- verifies that `mykey-daemon` is already active and reachable
+- offers PIN setup first
+- only offers security-key and biometric enrollment if PIN fallback exists
+- always enables MyKey-managed base PAM targets
+- then offers opt-in login and unlock takeover
 
 ### `mykey-auth enable`
 
 - enables MyKey-managed base PAM targets
 - shows local-auth summary
-- offers login setup at the end
+- if no MyKey PIN is configured yet, supported prompts stay on MyKey-managed
+  Linux password fallback until `mykey-pin set`
+- exists as the lower-level base-target action underneath `mykey-auth setup`
 
 ### `mykey-auth disable`
 
@@ -93,6 +138,11 @@ biometric-first PAM auth execution yet.
 Shows:
 
 - MyKey local-auth summary
+- whether the current runtime is still in password-fallback-only mode
+- normal password-fallback policy
+- whether elevated MyKey actions still require password
+- biometric attempt limit when biometric-first policy is active
+- ordered auth-chain state plus the active biometric backend set
 - base PAM integration state
 - login PAM integration state
 
@@ -103,28 +153,45 @@ Current scaffold:
 - drives `fprintd` and `Howdy` setup
 - stores TPM-sealed MyKey metadata for biometric registrations
 - tracks one Linux account per registry
-- lets MyKey choose one active biometric backend in policy today
+- uses the staged daemon policy model and keeps the full active biometric
+  provider set in policy
+- requires Linux account password verification for management actions through
+  the dedicated elevated-auth helper
 
 Current limitations:
 
-- no security-key path yet
-- no full biometric-first PAM auth execution yet
+- biometric runtime still needs broad host-installed calibration across the
+  supported PAM surfaces MyKey manages
 - `fprintd` tracking is limited by upstream backend semantics
 
 ## Security-Key Status
 
-Security-key auth is still planned.
+Security-key management and live runtime auth now exist.
 
-There is not yet:
+`mykey-security-key` currently provides:
 
-- a `mykey-security-key` executable flow
-- a daemon `SecurityKey` local-auth method
-- a PAM runtime path that uses a security key
+- `sudo mykey-security-key enroll [--nickname <name>]`
+- `sudo mykey-security-key status`
+- `sudo mykey-security-key unenroll`
+- `mykey-security-key test`
+- TPM-sealed per-user metadata for enrolled keys
+- a shared MyKey-owned `pam_u2f` authfile at `/etc/mykey/security-keys.pam_u2f`
+- a dedicated `mykey-security-key-auth` PAM service for test-time verification
+- a security-key stage in daemon-owned local-auth policy that `pam_mykey.so`
+  can use at runtime
+- PIN fallback after unsuccessful security-key auth attempts
 
-That work should follow the same pattern as biometrics:
+Current rules:
 
-- setup
-- validation
-- policy enablement
-- status
-- explicit teardown
+- enrollment requires a configured MyKey PIN fallback
+- enroll and unenroll require Linux account password verification through
+  `mykey-elevated-auth`
+- enrolling a key now enables the security-key stage for that Linux account
+- removing the last enrolled key falls back to PIN-only local auth
+- MyKey stores nickname, enrolled timestamp, masked credential hint, and the
+  provider mapping it needs to regenerate the shared authfile
+
+What is still missing:
+
+- broader host-installed validation of the `pam_u2f` runtime path
+- support for more than the current `pam_u2f` security-key backend

@@ -27,7 +27,9 @@ delivered.
   `~/.config/systemd/user/`.
 - System services should be shipped in `/usr/lib/systemd/system/`, not dropped
   into `/etc/systemd/system/`.
-- Package install should not auto-enable or auto-start services.
+- Package install should auto-enable and auto-start `mykey-daemon` so the auth
+  setup surface works immediately after installation.
+- Package install should not auto-enable or auto-start user services.
 - Runtime setup belongs in explicit commands and post-install instructions.
 
 ## Target Arch Layout
@@ -81,23 +83,26 @@ For Arch, that means:
 ## Post-Install Or User Setup
 
 These actions still matter, but should happen after package install through
-instructions or explicit commands, not during `pacman -S`:
+instructions or explicit commands, not during `pacman -S`, except for the
+required daemon bring-up:
 
-- enable and start `mykey-daemon`
-  - `sudo systemctl enable --now mykey-daemon`
+- `mykey-daemon` should already be enabled and started by package install
+- complete auth-first local setup
+  - `sudo mykey-auth setup`
+  - this should own:
+    - PIN-first setup
+    - optional security-key enrollment when PIN exists
+    - optional biometric enrollment when PIN exists
+    - required base PAM takeover
+    - optional login/unlock takeover
 - enroll into MyKey Secret Service ownership
   - `mykey-migrate --enroll`
+  - this is optional and separate from auth-first setup
   - on first setup, do not enable `mykey-secrets` manually before enroll
   - enroll should own the provider handoff sequence:
     - ensure the old provider is still active and readable
     - stop the old provider only after migration data is staged and verified
     - enable and start `mykey-secrets` only after takeover is safe
-- set up a MyKey PIN if local auth is wanted
-  - `mykey-pin set`
-- enable MyKey-managed PAM takeover for supported auth prompts
-  - `sudo mykey-auth enable`
-  - base takeover should be limited to `sudo` and `polkit-1`
-  - the command should then offer `sudo mykey-auth login` for opt-in login and unlock targets
 - disable MyKey-managed PAM takeover before a clean local-auth teardown
   - `sudo mykey-auth disable`
   - the command should then walk `sudo mykey-auth logout` for opt-in login teardown
@@ -111,7 +116,7 @@ instructions or explicit commands, not during `pacman -S`:
   - `journalctl -u mykey-daemon`
 
 If a package-level `.install` file is used, it should print these commands as
-guidance only. It should not execute them automatically.
+guidance, while still being allowed to bring `mykey-daemon` up automatically.
 
 ## Remove From The Package Path Entirely
 
@@ -123,7 +128,7 @@ These should not be part of package install or uninstall:
 - sudo keepalive loops
 - Secure Boot, TPM2, and EFI signature gating during package install
 - live health-check gating during package install
-- starting services automatically during package install
+- auto-starting user services during package install
 - copying user units into `~/.config/systemd/user/`
 - manual symlink fallback into `default.target.wants`
 - stale `/tmp` log cleanup
@@ -194,7 +199,7 @@ Package payload behavior that should move into packaging:
 
 Post-install or user setup that should become instructions:
 
-- daemon enable and start
+- auth-first setup guidance (`sudo mykey-auth setup`)
 - `mykey-migrate --enroll`
 - `mykey-secrets` user-service enablement
 - optional tray enablement

@@ -13,6 +13,8 @@ The daemon currently owns:
 
 - TPM-backed crypto helpers
 - PIN verification and related auth state
+- normal password-fallback rate limiting and status
+- elevated-auth rate limiting and short-lived management grants
 - daemon-owned local-auth policy
 - caller validation
 - privileged operations exposed over D-Bus
@@ -36,15 +38,49 @@ Local-auth state is daemon-owned.
 This is where MyKey tracks things like:
 
 - whether local auth is enabled
-- which backend is considered primary
-- whether PIN fallback is enabled
+- the ordered local-auth chain
+- which biometric backends are active inside the biometric stage
+- whether normal password fallback is allowed
+- whether elevated MyKey actions still require password
+- how many biometric attempts are allowed before fallback
 
 Current backends reflected in policy are:
 
 - PIN
 - biometric
+- security key
 
-Security-key policy is still planned.
+## Normal Password Fallback
+
+The daemon also owns the normal password-fallback backoff path used when
+`pam_mykey.so` is active but no MyKey PIN is configured yet.
+
+Current rules:
+
+- only trusted runtime frontends such as `mykey-auth` may read or mutate this
+  state
+- the backoff path is separate from both MyKey PIN lockout and elevated
+  password auth
+- successful Linux password verification clears the fallback backoff state
+
+## Elevated Management Auth
+
+The daemon now owns a separate elevated-auth path for high-risk MyKey actions.
+
+It currently covers:
+
+- first-time PIN enrollment
+- PIN reset
+- biometric management actions
+- security-key enroll and unenroll
+
+Current rules:
+
+- only the dedicated `mykey-elevated-auth` helper may grant elevated auth
+- trusted frontends can read elevated-auth rate-limit state
+- sensitive daemon methods consume one purpose-specific grant before mutating
+  PIN, biometric, or security-key policy
+- biometric management gets a longer-lived grant window than PIN setup/reset
 
 ## Caller Boundary
 
@@ -53,8 +89,11 @@ The daemon should be treated as the enforcement point for privileged actions.
 That includes:
 
 - local auth state inspection
+- elevated-auth state inspection and grant consumption
 - PIN setup/reset verification
 - biometric backend policy changes
+- security-key registry sealing and unsealing helpers used by
+  `mykey-security-key`
 - secret sealing and unsealing helpers used by other components
 
 ## Current Direction

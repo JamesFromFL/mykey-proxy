@@ -7,7 +7,7 @@ use std::path::Path;
 
 use hmac::{Hmac, Mac};
 use log::{debug, warn};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -159,6 +159,8 @@ const TRUSTED_MYKEY_BINARIES: &[&str] = &[
     "mykey-pin",
     "mykey-pin-auth",
     "mykey-auth",
+    "mykey-elevated-auth",
+    "mykey-security-key",
 ];
 
 fn is_valid_mykey_program(program: &str) -> bool {
@@ -253,32 +255,6 @@ fn read_ppid(pid: u32) -> Option<u32> {
         }
     }
     None
-}
-
-// ---------------------------------------------------------------------------
-// Binary integrity verification
-// ---------------------------------------------------------------------------
-
-/// SHA-256 hash the file at `path` and compare to `expected_hex`.
-/// Returns true if they match, false otherwise.
-pub fn verify_binary_integrity(path: &str, expected_hex: &str) -> bool {
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(e) => {
-            warn!("[validator] Cannot read binary at {path}: {e}");
-            return false;
-        }
-    };
-    let actual = hex::encode(Sha256::digest(&data));
-    let matches = actual == expected_hex;
-    if !matches {
-        warn!(
-            "[validator] Binary integrity MISMATCH for {path}: expected={expected_hex} actual={actual}"
-        );
-    } else {
-        debug!("[validator] Binary integrity OK: {path}");
-    }
-    matches
 }
 
 // ---------------------------------------------------------------------------

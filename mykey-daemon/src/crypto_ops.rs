@@ -194,12 +194,6 @@ pub fn b64url_encode(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-pub fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
-    URL_SAFE_NO_PAD
-        .decode(s)
-        .map_err(|e| format!("base64url decode error: {e}"))
-}
-
 // ---------------------------------------------------------------------------
 // CBOR primitives
 // ---------------------------------------------------------------------------

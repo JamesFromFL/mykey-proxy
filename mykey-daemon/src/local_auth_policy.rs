@@ -5,27 +5,37 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 const DEFAULT_AUTH_ROOT: &str = "/etc/mykey/auth";
+pub const DEFAULT_BIOMETRIC_ATTEMPT_LIMIT: u8 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum LocalAuthMethod {
+enum LegacyLocalAuthMethod {
     Pin,
     Biometric,
+    SecurityKey,
 }
 
-impl LocalAuthMethod {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalAuthStage {
+    Biometric,
+    SecurityKey,
+    Pin,
+}
+
+impl LocalAuthStage {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Pin => "pin",
             Self::Biometric => "biometric",
+            Self::SecurityKey => "security_key",
+            Self::Pin => "pin",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum BiometricBackend {
     Fprintd,
@@ -41,22 +51,80 @@ impl BiometricBackend {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LocalAuthPolicy {
     pub enabled: bool,
-    pub primary_method: LocalAuthMethod,
     pub pin_fallback_enabled: bool,
-    pub biometric_backend: Option<BiometricBackend>,
+    #[serde(default)]
+    pub biometric_backends: Vec<BiometricBackend>,
+    #[serde(default)]
+    pub security_key_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveLocalAuthPolicy {
+    pub enabled: bool,
+    pub auth_chain: Vec<LocalAuthStage>,
+    pub biometric_backends: Vec<BiometricBackend>,
+    pub security_key_enabled: bool,
+    pub pin_enabled: bool,
+    pub password_fallback_allowed: bool,
+    pub elevated_password_required: bool,
+    pub biometric_attempt_limit: u8,
 }
 
 impl Default for LocalAuthPolicy {
     fn default() -> Self {
         Self {
             enabled: false,
-            primary_method: LocalAuthMethod::Pin,
             pin_fallback_enabled: false,
-            biometric_backend: None,
+            biometric_backends: Vec::new(),
+            security_key_enabled: false,
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLocalAuthPolicy {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    pin_fallback_enabled: bool,
+    #[serde(default)]
+    biometric_backends: Vec<BiometricBackend>,
+    #[serde(default)]
+    security_key_enabled: bool,
+    #[serde(default)]
+    primary_method: Option<LegacyLocalAuthMethod>,
+    #[serde(default)]
+    biometric_backend: Option<BiometricBackend>,
+}
+
+impl From<RawLocalAuthPolicy> for LocalAuthPolicy {
+    fn from(raw: RawLocalAuthPolicy) -> Self {
+        let mut biometric_backends = raw.biometric_backends;
+        if biometric_backends.is_empty() {
+            if let Some(backend) = raw.biometric_backend {
+                biometric_backends.push(backend);
+            }
+        }
+
+        Self {
+            enabled: raw.enabled,
+            pin_fallback_enabled: raw.pin_fallback_enabled,
+            biometric_backends,
+            security_key_enabled: raw.security_key_enabled
+                || raw.primary_method == Some(LegacyLocalAuthMethod::SecurityKey),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalAuthPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        RawLocalAuthPolicy::deserialize(deserializer).map(Into::into)
     }
 }
 
@@ -75,11 +143,13 @@ impl LocalAuthPolicyStore {
         Self { root: root.into() }
     }
 
+    #[cfg(test)]
     pub fn read_policy(&self, uid: u32) -> Result<LocalAuthPolicy, String> {
         let (policy, _) = self.read_policy_internal(uid)?;
         Ok(normalise_policy(policy))
     }
 
+    #[cfg(test)]
     pub fn repair_policy(&self, uid: u32) -> Result<LocalAuthPolicy, String> {
         let (policy, existed) = self.read_policy_internal(uid)?;
         let normalised = normalise_policy(policy.clone());
@@ -107,15 +177,37 @@ impl LocalAuthPolicyStore {
     }
 
     pub fn enable_pin_only(&self, uid: u32) -> Result<(), String> {
-        let mut policy = self.read_policy(uid)?;
-        policy.enabled = true;
-        policy.primary_method = LocalAuthMethod::Pin;
-        policy.pin_fallback_enabled = true;
-        self.write_policy(uid, &policy)
+        self.write_policy(uid, &pin_only_policy())
     }
 
     pub fn on_pin_reset(&self, uid: u32) -> Result<(), String> {
         self.write_policy(uid, &LocalAuthPolicy::default())
+    }
+
+    pub fn sync_effective_policy(
+        &self,
+        uid: u32,
+        pin_is_set: bool,
+    ) -> Result<EffectiveLocalAuthPolicy, String> {
+        let (policy, existed) = self.read_policy_internal(uid)?;
+        let mut normalised = normalise_policy(policy.clone());
+        let mut should_persist = existed && normalised != policy;
+
+        if pin_is_set {
+            if should_backfill_pin_only(&normalised) {
+                normalised = pin_only_policy();
+                should_persist = true;
+            }
+        } else if normalised != LocalAuthPolicy::default() {
+            normalised = LocalAuthPolicy::default();
+            should_persist = true;
+        }
+
+        if should_persist {
+            self.write_policy(uid, &normalised)?;
+        }
+
+        Ok(effective_policy_from_state(normalised, pin_is_set))
     }
 
     fn ensure_user_dir(&self, uid: u32) -> Result<(), String> {
@@ -230,20 +322,88 @@ fn set_mode_if_supported(path: impl AsRef<Path>, mode: u32) -> Result<(), String
 }
 
 fn normalise_policy(mut policy: LocalAuthPolicy) -> LocalAuthPolicy {
-    if policy.biometric_backend.is_some() {
-        policy.primary_method = LocalAuthMethod::Biometric;
-        if !policy.pin_fallback_enabled {
-            return LocalAuthPolicy::default();
-        }
-    } else if policy.primary_method == LocalAuthMethod::Biometric {
+    policy.biometric_backends.sort();
+    policy.biometric_backends.dedup();
+
+    if !policy.enabled {
         return LocalAuthPolicy::default();
     }
 
-    if policy.primary_method == LocalAuthMethod::Pin && !policy.pin_fallback_enabled {
-        policy.enabled = false;
+    if !policy.pin_fallback_enabled {
+        return LocalAuthPolicy::default();
+    }
+
+    if !policy.security_key_enabled && policy.biometric_backends.is_empty() {
+        return pin_only_policy();
     }
 
     policy
+}
+
+fn pin_only_policy() -> LocalAuthPolicy {
+    LocalAuthPolicy {
+        enabled: true,
+        pin_fallback_enabled: true,
+        biometric_backends: Vec::new(),
+        security_key_enabled: false,
+    }
+}
+
+fn should_backfill_pin_only(policy: &LocalAuthPolicy) -> bool {
+    !policy.enabled
+        && !policy.pin_fallback_enabled
+        && !policy.security_key_enabled
+        && policy.biometric_backends.is_empty()
+}
+
+fn effective_policy_from_state(
+    policy: LocalAuthPolicy,
+    pin_is_set: bool,
+) -> EffectiveLocalAuthPolicy {
+    let mut auth_chain = Vec::new();
+    if policy.enabled {
+        if !policy.biometric_backends.is_empty() {
+            auth_chain.push(LocalAuthStage::Biometric);
+        }
+        if policy.security_key_enabled {
+            auth_chain.push(LocalAuthStage::SecurityKey);
+        }
+        if policy.pin_fallback_enabled {
+            auth_chain.push(LocalAuthStage::Pin);
+        }
+    }
+
+    let biometric_attempt_limit = if !policy.biometric_backends.is_empty() {
+        DEFAULT_BIOMETRIC_ATTEMPT_LIMIT
+    } else {
+        0
+    };
+
+    EffectiveLocalAuthPolicy {
+        enabled: !auth_chain.is_empty(),
+        auth_chain,
+        biometric_backends: policy.biometric_backends,
+        security_key_enabled: policy.security_key_enabled,
+        pin_enabled: policy.pin_fallback_enabled,
+        password_fallback_allowed: !policy.enabled || !pin_is_set,
+        elevated_password_required: true,
+        biometric_attempt_limit,
+    }
+}
+
+impl EffectiveLocalAuthPolicy {
+    pub fn as_persisted_policy(&self) -> LocalAuthPolicy {
+        if !self.enabled {
+            return LocalAuthPolicy::default();
+        }
+
+        LocalAuthPolicy {
+            enabled: true,
+            pin_fallback_enabled: self.pin_enabled,
+            biometric_backends: self.biometric_backends.clone(),
+            security_key_enabled: self.security_key_enabled,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -294,9 +454,41 @@ mod tests {
         let policy = store.read_policy(1000).expect("read written policy");
 
         assert!(policy.enabled);
-        assert_eq!(policy.primary_method, LocalAuthMethod::Pin);
         assert!(policy.pin_fallback_enabled);
-        assert_eq!(policy.biometric_backend, None);
+        assert!(policy.biometric_backends.is_empty());
+        assert!(!policy.security_key_enabled);
+    }
+
+    #[test]
+    fn effective_pin_only_policy_blocks_normal_password_fallback() {
+        let root = TestRoot::new();
+        let store = root.store();
+
+        store.enable_pin_only(1000).expect("enable pin-only policy");
+        let effective = store
+            .sync_effective_policy(1000, true)
+            .expect("read effective policy");
+
+        assert!(effective.enabled);
+        assert_eq!(effective.auth_chain, vec![LocalAuthStage::Pin]);
+        assert!(effective.pin_enabled);
+        assert!(!effective.password_fallback_allowed);
+        assert!(effective.elevated_password_required);
+        assert_eq!(effective.biometric_attempt_limit, 0);
+    }
+
+    #[test]
+    fn disabled_policy_allows_normal_password_fallback() {
+        let root = TestRoot::new();
+        let store = root.store();
+
+        let effective = store
+            .sync_effective_policy(1000, false)
+            .expect("read effective default policy");
+
+        assert!(!effective.enabled);
+        assert!(effective.password_fallback_allowed);
+        assert!(effective.elevated_password_required);
     }
 
     #[test]
@@ -310,9 +502,7 @@ mod tests {
             .expect("update policy on pin reset");
         let policy = store.read_policy(1000).expect("read updated policy");
 
-        assert!(!policy.enabled);
-        assert_eq!(policy.primary_method, LocalAuthMethod::Pin);
-        assert!(!policy.pin_fallback_enabled);
+        assert_eq!(policy, LocalAuthPolicy::default());
     }
 
     #[test]
@@ -325,9 +515,9 @@ mod tests {
                 1000,
                 &LocalAuthPolicy {
                     enabled: true,
-                    primary_method: LocalAuthMethod::Biometric,
                     pin_fallback_enabled: true,
-                    biometric_backend: Some(BiometricBackend::Fprintd),
+                    biometric_backends: vec![BiometricBackend::Fprintd],
+                    security_key_enabled: false,
                 },
             )
             .expect("write biometric policy");
@@ -385,5 +575,185 @@ mod tests {
 
         assert_eq!(repaired, LocalAuthPolicy::default());
         assert_eq!(persisted, LocalAuthPolicy::default());
+    }
+
+    #[test]
+    fn missing_pin_forces_biometric_policy_back_to_default() {
+        let root = TestRoot::new();
+        let store = root.store();
+
+        store
+            .write_policy(
+                1000,
+                &LocalAuthPolicy {
+                    enabled: true,
+                    pin_fallback_enabled: true,
+                    biometric_backends: vec![BiometricBackend::Fprintd],
+                    security_key_enabled: false,
+                },
+            )
+            .expect("write biometric policy");
+
+        let effective = store
+            .sync_effective_policy(1000, false)
+            .expect("repair missing-pin policy");
+        let persisted = store.read_policy(1000).expect("read repaired policy");
+
+        assert!(!effective.enabled);
+        assert!(effective.password_fallback_allowed);
+        assert!(effective.auth_chain.is_empty());
+        assert!(effective.biometric_backends.is_empty());
+        assert_eq!(persisted, LocalAuthPolicy::default());
+    }
+
+    #[test]
+    fn security_key_policy_requires_pin_fallback() {
+        let root = TestRoot::new();
+        let store = root.store();
+
+        store
+            .write_policy(
+                1000,
+                &LocalAuthPolicy {
+                    enabled: true,
+                    pin_fallback_enabled: false,
+                    biometric_backends: Vec::new(),
+                    security_key_enabled: true,
+                },
+            )
+            .expect("write invalid security-key policy");
+
+        let policy = store.read_policy(1000).expect("read sanitised policy");
+        assert_eq!(policy, LocalAuthPolicy::default());
+    }
+
+    #[test]
+    fn effective_security_key_policy_blocks_normal_password_fallback() {
+        let root = TestRoot::new();
+        let store = root.store();
+
+        store
+            .write_policy(
+                1000,
+                &LocalAuthPolicy {
+                    enabled: true,
+                    pin_fallback_enabled: true,
+                    biometric_backends: Vec::new(),
+                    security_key_enabled: true,
+                },
+            )
+            .expect("write security-key policy");
+
+        let effective = store
+            .sync_effective_policy(1000, true)
+            .expect("read effective policy");
+
+        assert!(effective.enabled);
+        assert_eq!(
+            effective.auth_chain,
+            vec![LocalAuthStage::SecurityKey, LocalAuthStage::Pin]
+        );
+        assert!(effective.pin_enabled);
+        assert!(effective.security_key_enabled);
+        assert!(!effective.password_fallback_allowed);
+        assert_eq!(effective.biometric_attempt_limit, 0);
+    }
+
+    #[test]
+    fn biometric_policy_uses_default_attempt_limit() {
+        let root = TestRoot::new();
+        let store = root.store();
+
+        store
+            .write_policy(
+                1000,
+                &LocalAuthPolicy {
+                    enabled: true,
+                    pin_fallback_enabled: true,
+                    biometric_backends: vec![BiometricBackend::Howdy],
+                    security_key_enabled: false,
+                },
+            )
+            .expect("write biometric policy");
+
+        let effective = store
+            .sync_effective_policy(1000, true)
+            .expect("read effective biometric policy");
+
+        assert!(effective.enabled);
+        assert_eq!(
+            effective.auth_chain,
+            vec![LocalAuthStage::Biometric, LocalAuthStage::Pin]
+        );
+        assert_eq!(
+            effective.biometric_attempt_limit,
+            DEFAULT_BIOMETRIC_ATTEMPT_LIMIT
+        );
+        assert!(!effective.password_fallback_allowed);
+        assert!(effective.elevated_password_required);
+    }
+
+    #[test]
+    fn legacy_primary_method_biometric_is_read_into_backend_set_model() {
+        let root = TestRoot::new();
+        let store = root.store();
+        let policy_path = root.path.join("1000").join("policy.json");
+        std::fs::create_dir_all(policy_path.parent().expect("policy parent"))
+            .expect("create policy parent");
+        std::fs::write(
+            &policy_path,
+            r#"{
+  "enabled": true,
+  "primary_method": "biometric",
+  "pin_fallback_enabled": true,
+  "biometric_backend": "fprintd"
+}"#,
+        )
+        .expect("write legacy policy");
+
+        let policy = store.read_policy(1000).expect("read upgraded policy");
+        assert_eq!(
+            policy,
+            LocalAuthPolicy {
+                enabled: true,
+                pin_fallback_enabled: true,
+                biometric_backends: vec![BiometricBackend::Fprintd],
+                security_key_enabled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn effective_policy_orders_biometrics_before_security_key_and_pin() {
+        let root = TestRoot::new();
+        let store = root.store();
+
+        store
+            .write_policy(
+                1000,
+                &LocalAuthPolicy {
+                    enabled: true,
+                    pin_fallback_enabled: true,
+                    biometric_backends: vec![BiometricBackend::Fprintd],
+                    security_key_enabled: true,
+                },
+            )
+            .expect("write staged policy");
+
+        let effective = store
+            .sync_effective_policy(1000, true)
+            .expect("read staged policy");
+
+        assert_eq!(
+            effective.auth_chain,
+            vec![
+                LocalAuthStage::Biometric,
+                LocalAuthStage::SecurityKey,
+                LocalAuthStage::Pin
+            ]
+        );
+        assert_eq!(effective.biometric_backends, vec![BiometricBackend::Fprintd]);
+        assert!(effective.security_key_enabled);
+        assert!(effective.pin_enabled);
     }
 }
