@@ -4,10 +4,10 @@
 // (gnome-keyring, KWallet, KeePassXC, etc.) and reads all secrets
 // so they can be migrated into MyKey's TPM2-sealed storage.
 
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::time::Duration;
-use sha2::{Digest, Sha256};
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zeroize::Zeroize;
@@ -76,10 +76,14 @@ impl DestinationPlan {
 
 #[derive(Debug, Clone)]
 pub struct ProviderSecretInfo {
+    pub item_path: String,
     pub collection_path: String,
     pub label: String,
     pub attributes: HashMap<String, String>,
     pub content_type: String,
+    pub locked: Option<bool>,
+    pub value_sha256: Option<String>,
+    pub value_read_error: Option<String>,
 }
 
 /// A secret item read from the source Secret Service provider.
@@ -133,7 +137,12 @@ where
         .map_err(|e| format!("Properties proxy for {path} failed: {e}"))
 }
 
-fn get_string_prop(conn: &Connection, path: &str, iface: &str, prop: &str) -> Result<String, String> {
+fn get_string_prop(
+    conn: &Connection,
+    path: &str,
+    iface: &str,
+    prop: &str,
+) -> Result<String, String> {
     let proxy = props_proxy(conn, path)?;
     let val: OwnedValue = proxy
         .call("Get", &(iface, prop))
@@ -237,7 +246,8 @@ fn provider_kind(process_name: &str) -> ProviderKind {
     let lower = process_name.to_lowercase();
     if lower.contains("gnome-keyring") {
         ProviderKind::GnomeKeyring
-    } else if lower.contains("kwalletd") || lower.contains("kwallet") || lower.contains("ksecretd") {
+    } else if lower.contains("kwalletd") || lower.contains("kwallet") || lower.contains("ksecretd")
+    {
         ProviderKind::KWallet
     } else if lower.contains("keepassxc") {
         ProviderKind::KeepassXC
@@ -253,6 +263,12 @@ fn collection_label(conn: &Connection, path: &str) -> Option<String> {
 fn collection_locked(conn: &Connection, path: &str) -> Option<bool> {
     let proxy = props_proxy(conn, path).ok()?;
     let val: OwnedValue = proxy.call("Get", &(COL_IFACE, "Locked")).ok()?;
+    bool::try_from(val).ok()
+}
+
+fn item_locked(conn: &Connection, path: &str) -> Option<bool> {
+    let proxy = props_proxy(conn, path).ok()?;
+    let val: OwnedValue = proxy.call("Get", &(ITEM_IFACE, "Locked")).ok()?;
     bool::try_from(val).ok()
 }
 
@@ -279,7 +295,10 @@ fn is_ready_collection(conn: &Connection, path: &str) -> bool {
 fn unique_paths(paths: impl IntoIterator<Item = OwnedObjectPath>) -> Vec<OwnedObjectPath> {
     let mut out: Vec<OwnedObjectPath> = Vec::new();
     for path in paths {
-        if out.iter().all(|existing| existing.as_str() != path.as_str()) {
+        if out
+            .iter()
+            .all(|existing| existing.as_str() != path.as_str())
+        {
             out.push(path);
         }
     }
@@ -366,19 +385,14 @@ fn detect_systemd_service(pid: u32) -> Option<String> {
     // Try user-level first, then system-level as fallback.
     // Some providers (e.g. gnome-keyring started by the GNOME session manager)
     // may not appear as user services and require the system-level query.
-    let attempts: [Vec<&str>; 2] = [
-        vec!["--user", "status", &pid_str],
-        vec!["status", &pid_str],
-    ];
+    let attempts: [Vec<&str>; 2] = [vec!["--user", "status", &pid_str], vec!["status", &pid_str]];
     for args in &attempts {
-        if let Ok(output) = std::process::Command::new("systemctl")
-            .args(args)
-            .output()
-        {
+        if let Ok(output) = std::process::Command::new("systemctl").args(args).output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 // First line is typically: "● service-name.service - Description"
-                let trimmed = line.trim_start_matches(|c: char| c == '\u{25cf}' || c == '*' || c == ' ');
+                let trimmed =
+                    line.trim_start_matches(|c: char| c == '\u{25cf}' || c == '*' || c == ' ');
                 if let Some(word) = trimmed.split_whitespace().next() {
                     if word.ends_with(".service") {
                         return Some(word.to_string());
@@ -507,11 +521,8 @@ pub fn read_all_secrets() -> Result<Vec<MigratedItem>, String> {
         let ready_path = match ensure_unlocked_col(&conn, col_path.clone()) {
             Ok(path) => path,
             Err(e) => {
-                let label = collection_label(&conn, col_str)
-                    .unwrap_or_else(|| col_str.to_string());
-                errors.push(format!(
-                    "Cannot unlock source collection '{label}': {e}"
-                ));
+                let label = collection_label(&conn, col_str).unwrap_or_else(|| col_str.to_string());
+                errors.push(format!("Cannot unlock source collection '{label}': {e}"));
                 continue;
             }
         };
@@ -539,6 +550,16 @@ pub fn read_all_secrets() -> Result<Vec<MigratedItem>, String> {
         };
 
         for item_path in &item_paths {
+            let item_path = match ensure_unlocked_item(&conn, item_path.clone()) {
+                Ok(path) => path,
+                Err(e) => {
+                    errors.push(format!(
+                        "Cannot unlock source item {}: {e}",
+                        item_path.as_str()
+                    ));
+                    continue;
+                }
+            };
             let item_str = item_path.as_str();
 
             let label = match get_string_prop(&conn, item_str, ITEM_IFACE, "Label") {
@@ -607,17 +628,52 @@ pub fn read_all_secrets() -> Result<Vec<MigratedItem>, String> {
 /// Stop the detected Secret Service provider so MyKey can take over.
 ///
 /// KeePassXC requires interactive user confirmation.
-/// All other providers are stopped via systemd (service + socket units)
-/// and pkill.
+/// KWallet uses dynamic D-Bus activation on some systems, so it only releases
+/// the current Secret Service owner and avoids masking transient units.
+/// Other providers are stopped via systemd (service + socket units) and pkill.
 ///
 /// Only called after all secrets have been successfully migrated and verified.
 pub fn stop_provider(info: &ProviderInfo) -> Result<(), String> {
-    if info.process_name.to_lowercase().contains("keepassxc") {
-        stop_keepassxc()?;
-    } else {
-        stop_generic(info)?;
+    match provider_kind(&info.process_name) {
+        ProviderKind::KeepassXC => stop_keepassxc()?,
+        ProviderKind::KWallet => stop_kwallet_secret_service(info)?,
+        _ => stop_generic(info)?,
     }
     Ok(())
+}
+
+fn stop_kwallet_secret_service(info: &ProviderInfo) -> Result<(), String> {
+    if bus_owner_matches("ksecretd") {
+        std::process::Command::new("pkill")
+            .args(["-f", "ksecretd"])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok();
+    } else if bus_owner_matches("kwalletd") {
+        std::process::Command::new("pkill")
+            .args(["-f", "kwalletd"])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok();
+    } else {
+        std::process::Command::new("pkill")
+            .args(["-f", info.process_name.as_str()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok();
+    }
+
+    for _ in 0..20 {
+        if !ss_still_owned() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    Err(format!(
+        "Could not stop {} — org.freedesktop.secrets is still owned",
+        info.process_name
+    ))
 }
 
 /// Write the user's provider info file recording what was disabled.
@@ -659,10 +715,8 @@ pub fn write_provider_info(info: &ProviderInfo) -> Result<(), String> {
 /// "no migration was done, skip unenroll".
 pub fn read_provider_info() -> Result<ProviderInfoFile, String> {
     let path = paths::provider_info_path();
-    let data = std::fs::read(&path)
-        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-    serde_json::from_slice(&data)
-        .map_err(|e| format!("Cannot parse provider info: {e}"))
+    let data = std::fs::read(&path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    serde_json::from_slice(&data).map_err(|e| format!("Cannot parse provider info: {e}"))
 }
 
 /// Return true if `process_name` is findable on the system PATH or in /usr/bin.
@@ -699,7 +753,9 @@ pub fn reinstall_provider(package_name: &str) -> Result<(), String> {
         other => {
             eprintln!("Unknown distro ID: {other:?}");
             eprintln!("Install {package_name} manually, then run mykey-migrate --unenroll again.");
-            return Err(format!("Cannot detect package manager for distro: {other:?}"));
+            return Err(format!(
+                "Cannot detect package manager for distro: {other:?}"
+            ));
         }
     };
 
@@ -749,6 +805,16 @@ fn dbus_ping(conn: &Connection, dest: &str, path: &str) -> bool {
         .is_ok()
 }
 
+fn kwallet_daemon_ready(process_name: &str) -> bool {
+    let conn = match session_bus() {
+        Ok(conn) => conn,
+        Err(_) => return false,
+    };
+    kwallet_bus_targets(process_name)
+        .into_iter()
+        .any(|(dest, path)| dbus_ping(&conn, dest, path))
+}
+
 pub fn provider_ready(info: &ProviderInfoFile) -> bool {
     match provider_kind(&info.process_name) {
         ProviderKind::GnomeKeyring => bus_owner_matches("gnome-keyring-daemon"),
@@ -766,7 +832,10 @@ pub fn start_provider(info: &ProviderInfoFile) -> Result<(), String> {
 
     match kind {
         ProviderKind::GnomeKeyring => {
-            for unit in &["gnome-keyring-daemon.socket", "gnome-keyring-daemon.service"] {
+            for unit in &[
+                "gnome-keyring-daemon.socket",
+                "gnome-keyring-daemon.service",
+            ] {
                 user_systemctl(&["reset-failed", unit]);
                 user_systemctl(&["unmask", unit]);
                 user_systemctl(&["enable", unit]);
@@ -803,17 +872,34 @@ pub fn start_provider(info: &ProviderInfoFile) -> Result<(), String> {
             }
 
             if !spawned && check_provider_installed(&info.process_name) {
-                if std::process::Command::new(&info.process_name).spawn().is_ok() {
+                if std::process::Command::new(&info.process_name)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .is_ok()
+                {
                     spawned = true;
                 }
             }
 
             if !spawned && check_provider_installed("kwalletd6") {
-                std::process::Command::new("kwalletd6").spawn().ok();
+                std::process::Command::new("kwalletd6")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .ok();
             }
         }
         ProviderKind::KeepassXC => {
-            std::process::Command::new("keepassxc").spawn().ok();
+            if !check_provider_installed("keepassxc") {
+                return Err("KeePassXC is not installed.".to_string());
+            }
+
+            std::process::Command::new("keepassxc")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok();
             println!("KeePassXC requires manual setup:");
             println!("1. Open KeePassXC");
             println!(
@@ -850,11 +936,22 @@ pub fn start_provider(info: &ProviderInfoFile) -> Result<(), String> {
         }
     }
 
-    let attempts = if kind == ProviderKind::KeepassXC { 120 } else { 20 };
-    let sleep_ms = if kind == ProviderKind::KeepassXC { 1000 } else { 500 };
+    let attempts = if kind == ProviderKind::KeepassXC {
+        120
+    } else {
+        20
+    };
+    let sleep_ms = if kind == ProviderKind::KeepassXC {
+        1000
+    } else {
+        500
+    };
 
     for _ in 0..attempts {
         std::thread::sleep(Duration::from_millis(sleep_ms));
+        if kind == ProviderKind::KWallet && kwallet_daemon_ready(&info.process_name) {
+            return Ok(());
+        }
         if provider_ready(info) {
             return Ok(());
         }
@@ -901,7 +998,12 @@ fn create_item_on_collection(
         Value::from(attributes.clone()),
     );
 
-    let secret = (&session_path, Vec::<u8>::new(), value.to_vec(), content_type);
+    let secret = (
+        &session_path,
+        Vec::<u8>::new(),
+        value.to_vec(),
+        content_type,
+    );
 
     let (item_path, prompt): (OwnedObjectPath, OwnedObjectPath) = col_proxy
         .call("CreateItem", &(&props, &secret, replace))
@@ -914,9 +1016,14 @@ fn create_item_on_collection(
         return Err("CreateItem returned neither an item nor a prompt".to_string());
     }
 
-    let result = invoke_prompt_and_wait(conn, prompt.as_str())?;
-    OwnedObjectPath::try_from(result)
-        .map_err(|_| "CreateItem prompt result is not an ObjectPath".to_string())
+    invoke_prompt_and_wait_for_item(
+        conn,
+        prompt.as_str(),
+        collection_path,
+        label,
+        attributes,
+        60_000,
+    )
 }
 
 fn delete_item_from_provider(conn: &Connection, item_path: &OwnedObjectPath) -> Result<(), String> {
@@ -935,7 +1042,10 @@ fn delete_item_from_provider(conn: &Connection, item_path: &OwnedObjectPath) -> 
 pub fn probe_collection_write(collection_path: &OwnedObjectPath) -> Result<(), String> {
     let conn = session_bus()?;
     let mut attrs = HashMap::new();
-    attrs.insert("mykey:migrate-probe".to_string(), uuid::Uuid::new_v4().to_string());
+    attrs.insert(
+        "mykey:migrate-probe".to_string(),
+        uuid::Uuid::new_v4().to_string(),
+    );
     let item = create_item_on_collection(
         &conn,
         collection_path,
@@ -999,23 +1109,38 @@ pub fn list_provider_secrets() -> Result<Vec<ProviderSecretInfo>, String> {
             let item_str = item_path.as_str();
             let label = get_string_prop(&conn, item_str, ITEM_IFACE, "Label").unwrap_or_default();
             let attrs = get_attributes(&conn, item_str).unwrap_or_default();
-            let content_type = Proxy::new(&conn, SS_DEST, item_str, ITEM_IFACE)
+            let locked = props_proxy(&conn, item_str)
                 .ok()
                 .and_then(|proxy| {
                     proxy
+                        .call::<_, _, OwnedValue>("Get", &(ITEM_IFACE, "Locked"))
+                        .ok()
+                })
+                .and_then(|value| bool::try_from(value).ok());
+            let (content_type, value_sha256, value_read_error) =
+                match Proxy::new(&conn, SS_DEST, item_str, ITEM_IFACE) {
+                    Ok(proxy) => match proxy
                         .call::<_, _, (OwnedObjectPath, Vec<u8>, Vec<u8>, String)>(
                             "GetSecret",
                             &(&session_path,),
-                        )
-                        .ok()
-                        .map(|(_, _, _, content_type)| content_type)
-                })
-                .unwrap_or_default();
+                        ) {
+                        Ok((_, _, value, content_type)) => {
+                            let value_sha256 = hex::encode(Sha256::digest(&value));
+                            (content_type, Some(value_sha256), None)
+                        }
+                        Err(e) => (String::new(), None, Some(e.to_string())),
+                    },
+                    Err(e) => (String::new(), None, Some(e.to_string())),
+                };
             result.push(ProviderSecretInfo {
+                item_path: item_str.to_string(),
                 collection_path: col_str.to_string(),
                 label,
                 attributes: attrs,
                 content_type,
+                locked,
+                value_sha256,
+                value_read_error,
             });
         }
     }
@@ -1089,12 +1214,18 @@ fn stop_generic(info: &ProviderInfo) -> Result<(), String> {
     let lower = info.process_name.to_lowercase();
 
     if lower.contains("gnome-keyring") {
-        for unit in &["gnome-keyring-daemon.socket", "gnome-keyring-daemon.service"] {
+        for unit in &[
+            "gnome-keyring-daemon.socket",
+            "gnome-keyring-daemon.service",
+        ] {
             let _ = std::process::Command::new("systemctl")
                 .args(["--user", "stop", unit])
                 .status();
         }
-        for unit in &["gnome-keyring-daemon.socket", "gnome-keyring-daemon.service"] {
+        for unit in &[
+            "gnome-keyring-daemon.socket",
+            "gnome-keyring-daemon.service",
+        ] {
             let _ = std::process::Command::new("systemctl")
                 .args(["--user", "disable", unit])
                 .status();
@@ -1168,10 +1299,9 @@ pub fn install_cmd_hint(package_name: &str) -> String {
 
 /// Remove the XDG autostart entry for mykey-secrets, if it exists.
 pub fn remove_mykey_autostart() -> Result<(), String> {
-    let home = std::env::var("HOME")
-        .map_err(|_| "HOME environment variable not set".to_string())?;
-    let desktop_path = std::path::Path::new(&home)
-        .join(".config/autostart/mykey-secrets.desktop");
+    let home =
+        std::env::var("HOME").map_err(|_| "HOME environment variable not set".to_string())?;
+    let desktop_path = std::path::Path::new(&home).join(".config/autostart/mykey-secrets.desktop");
     if desktop_path.exists() {
         std::fs::remove_file(&desktop_path)
             .map_err(|e| format!("Cannot remove {}: {e}", desktop_path.display()))?;
@@ -1200,8 +1330,8 @@ fn invoke_prompt_and_wait(conn: &Connection, prompt_path: &str) -> Result<OwnedV
 
     std::thread::spawn(move || {
         let result: Result<OwnedValue, String> = (|| {
-            let conn2 = Connection::session()
-                .map_err(|e| format!("Session bus for signal: {e}"))?;
+            let conn2 =
+                Connection::session().map_err(|e| format!("Session bus for signal: {e}"))?;
             let proxy = Proxy::new(
                 &conn2,
                 SS_DEST,
@@ -1280,8 +1410,95 @@ fn invoke_prompt_and_wait_for_collection(
     })
 }
 
+fn item_matches(
+    conn: &Connection,
+    item_path: &str,
+    label: &str,
+    attributes: &HashMap<String, String>,
+) -> bool {
+    get_string_prop(conn, item_path, ITEM_IFACE, "Label").as_deref() == Ok(label)
+        && get_attributes(conn, item_path)
+            .map(|actual| {
+                attributes
+                    .iter()
+                    .all(|(key, expected)| actual.get(key) == Some(expected))
+            })
+            .unwrap_or(false)
+}
+
+fn find_item_by_metadata_in_collection(
+    conn: &Connection,
+    collection_path: &OwnedObjectPath,
+    label: &str,
+    attributes: &HashMap<String, String>,
+) -> Option<OwnedObjectPath> {
+    get_object_paths_prop(conn, collection_path.as_str(), COL_IFACE, "Items")
+        .ok()?
+        .into_iter()
+        .find(|item| item_matches(conn, item.as_str(), label, attributes))
+}
+
+fn invoke_prompt_and_wait_for_item(
+    conn: &Connection,
+    prompt_path: &str,
+    collection_path: &OwnedObjectPath,
+    label: &str,
+    attributes: &HashMap<String, String>,
+    timeout_ms: u64,
+) -> Result<OwnedObjectPath, String> {
+    let prompt_proxy = Proxy::new(conn, SS_DEST, prompt_path, "org.freedesktop.Secret.Prompt")
+        .map_err(|e| format!("Prompt proxy: {e}"))?;
+    let _: () = prompt_proxy
+        .call("Prompt", &("",))
+        .map_err(|e| format!("Prompt.Prompt: {e}"))?;
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    while std::time::Instant::now() < deadline {
+        if let Some(item) =
+            find_item_by_metadata_in_collection(conn, collection_path, label, attributes)
+        {
+            return Ok(item);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    Err(
+        "Timed out waiting for keychain dialog (60 s). Run mykey-migrate --unenroll again."
+            .to_string(),
+    )
+}
+
+fn invoke_prompt_and_wait_for_item_unlock(
+    conn: &Connection,
+    prompt_path: &str,
+    item_path: &OwnedObjectPath,
+    timeout_ms: u64,
+) -> Result<OwnedObjectPath, String> {
+    let prompt_proxy = Proxy::new(conn, SS_DEST, prompt_path, "org.freedesktop.Secret.Prompt")
+        .map_err(|e| format!("Prompt proxy: {e}"))?;
+    let _: () = prompt_proxy
+        .call("Prompt", &("",))
+        .map_err(|e| format!("Prompt.Prompt: {e}"))?;
+
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    while std::time::Instant::now() < deadline {
+        if matches!(item_locked(conn, item_path.as_str()), Some(false)) {
+            return Ok(item_path.clone());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    Err(
+        "Timed out waiting for item unlock dialog (60 s). Run mykey-migrate --enroll again."
+            .to_string(),
+    )
+}
+
 /// Unlock a collection, invoking a Prompt if the provider requires one.
-fn ensure_unlocked_col(conn: &Connection, path: OwnedObjectPath) -> Result<OwnedObjectPath, String> {
+fn ensure_unlocked_col(
+    conn: &Connection,
+    path: OwnedObjectPath,
+) -> Result<OwnedObjectPath, String> {
     if !is_live_collection(conn, path.as_str()) {
         return Err(format!(
             "Collection {} is not a live Secret Service collection",
@@ -1318,15 +1535,48 @@ fn ensure_unlocked_col(conn: &Connection, path: OwnedObjectPath) -> Result<Owned
     })
 }
 
+fn ensure_unlocked_item(
+    conn: &Connection,
+    path: OwnedObjectPath,
+) -> Result<OwnedObjectPath, String> {
+    if matches!(item_locked(conn, path.as_str()), Some(false)) {
+        return Ok(path);
+    }
+
+    let svc = service_proxy(conn)?;
+    let (_, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) = svc
+        .call("Unlock", &(vec![path.clone()],))
+        .map_err(|e| format!("Unlock item failed: {e}"))?;
+
+    if prompt.as_str() != "/" {
+        println!("  (If a dialog appears, please complete it — this will continue automatically.)");
+        return invoke_prompt_and_wait_for_item_unlock(conn, prompt.as_str(), &path, 60_000);
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if matches!(item_locked(conn, path.as_str()), Some(false)) {
+            return Ok(path);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    Err(format!(
+        "Item {} did not become an unlocked Secret Service item",
+        path.as_str()
+    ))
+}
+
 fn supports_collection_creation(kind: ProviderKind) -> bool {
-    matches!(
-        kind,
-        ProviderKind::GnomeKeyring | ProviderKind::Generic
-    )
+    matches!(kind, ProviderKind::GnomeKeyring | ProviderKind::Generic)
 }
 
 fn supports_multi_collection(kind: ProviderKind) -> bool {
     matches!(kind, ProviderKind::GnomeKeyring)
+}
+
+fn supports_write_probe(kind: ProviderKind) -> bool {
+    !matches!(kind, ProviderKind::KeepassXC)
 }
 
 fn default_collection_label(kind: ProviderKind) -> &'static str {
@@ -1342,6 +1592,56 @@ fn kwallet_wallet_ready_error() -> String {
     "KWallet Secret Service compatibility is running, but no wallet is open or exported. \
 Open or create the KDE wallet (usually 'kdewallet') in KDE Wallet Manager or from a KDE password prompt, unlock it, then run mykey-migrate --unenroll again."
         .to_string()
+}
+
+fn kwallet_bus_targets(process_name: &str) -> [(&'static str, &'static str); 2] {
+    let lower = process_name.to_lowercase();
+    if lower.contains("kwalletd5") {
+        [
+            ("org.kde.kwalletd5", "/modules/kwalletd5"),
+            ("org.kde.kwalletd6", "/modules/kwalletd6"),
+        ]
+    } else {
+        [
+            ("org.kde.kwalletd6", "/modules/kwalletd6"),
+            ("org.kde.kwalletd5", "/modules/kwalletd5"),
+        ]
+    }
+}
+
+pub fn trigger_kwallet_wallet_prompt(process_name: &str) -> Result<String, String> {
+    let conn = session_bus()?;
+
+    for (dest, path) in kwallet_bus_targets(process_name) {
+        let proxy = match Proxy::new(&conn, dest, path, "org.kde.KWallet") {
+            Ok(proxy) => proxy,
+            Err(_) => continue,
+        };
+
+        let wallet_name = proxy
+            .call::<_, _, String>("localWallet", &())
+            .or_else(|_| proxy.call::<_, _, String>("networkWallet", &()))
+            .unwrap_or_else(|_| "kdewallet".to_string());
+
+        if proxy
+            .call::<_, _, i32>(
+                "openAsync",
+                &(wallet_name.as_str(), 0_i64, "mykey-migrate", false),
+            )
+            .is_ok()
+        {
+            return Ok(wallet_name);
+        }
+
+        if proxy
+            .call::<_, _, i32>("open", &(wallet_name.as_str(), 0_i64, "mykey-migrate"))
+            .is_ok()
+        {
+            return Ok(wallet_name);
+        }
+    }
+
+    Err("Could not trigger the KWallet wallet-open prompt.".to_string())
 }
 
 fn secret_service_activation_exec() -> Option<String> {
@@ -1407,7 +1707,10 @@ fn create_and_get_collection(
 ) -> Result<OwnedObjectPath, String> {
     let svc = service_proxy(conn)?;
     let mut props: HashMap<&str, Value<'_>> = HashMap::new();
-    props.insert("org.freedesktop.Secret.Collection.Label", Value::from(label));
+    props.insert(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from(label),
+    );
 
     let alias = alias.unwrap_or("");
     let (col_path, prompt): (OwnedObjectPath, OwnedObjectPath) = svc
@@ -1478,7 +1781,11 @@ fn resolve_or_create_collection(
     let created = create_and_get_collection(
         conn,
         label,
-        if make_default_alias { Some("default") } else { None },
+        if make_default_alias {
+            Some("default")
+        } else {
+            None
+        },
     )?;
     ensure_unlocked_col(conn, created)
 }
@@ -1524,13 +1831,13 @@ pub fn prepare_destination(
             default_collection.clone()
         };
 
-        if probed_paths.insert(target.as_str().to_string()) {
+        if supports_write_probe(kind) && probed_paths.insert(target.as_str().to_string()) {
             probe_collection_write(&target)?;
         }
         collection_by_source.insert(source.id.clone(), target);
     }
 
-    if probed_paths.is_empty() {
+    if supports_write_probe(kind) && probed_paths.is_empty() {
         probe_collection_write(&default_collection)?;
     }
 
@@ -1610,7 +1917,7 @@ pub fn start_provider_by_name(name: &str) -> Result<(), String> {
         },
         "kwalletd6" => ProviderInfoFile {
             process_name: kwallet_process.to_string(),
-            service_name: Some("plasma-kwalletd.service".to_string()),
+            service_name: None,
             package_name: "kwallet6".to_string(),
             keychain_path: None,
             keychain_deleted: false,

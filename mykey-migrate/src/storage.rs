@@ -7,9 +7,9 @@
 // Fallback:
 //   ~/.local/share/mykey/secrets/<collection_id>/...
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 
 use crate::paths;
 
@@ -42,8 +42,8 @@ fn save_collection_in(base_dir: &Path, c: &StoredCollection) -> Result<(), Strin
     let dir = base_dir.join(&c.id);
     paths::ensure_private_dir(&dir)?;
     let path = dir.join("collection.json");
-    let data = serde_json::to_vec_pretty(c)
-        .map_err(|e| format!("Cannot serialise collection: {e}"))?;
+    let data =
+        serde_json::to_vec_pretty(c).map_err(|e| format!("Cannot serialise collection: {e}"))?;
     paths::write_private_file(&path, &data)
 }
 
@@ -51,8 +51,8 @@ fn save_item_in(base_dir: &Path, item: &StoredItem) -> Result<(), String> {
     let dir = base_dir.join(&item.collection_id);
     paths::ensure_private_dir(&dir)?;
     let path = dir.join(format!("{}.json", item.id));
-    let data = serde_json::to_vec_pretty(item)
-        .map_err(|e| format!("Cannot serialise item: {e}"))?;
+    let data =
+        serde_json::to_vec_pretty(item).map_err(|e| format!("Cannot serialise item: {e}"))?;
     paths::write_private_file(&path, &data)
 }
 
@@ -85,6 +85,40 @@ pub struct StagedStorage {
 
 pub struct ActivatedStorage {
     previous_base: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StorageAuditIssue {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StorageAudit {
+    pub base_dir: PathBuf,
+    pub raw_collection_dirs: usize,
+    pub raw_item_files: usize,
+    pub parsed_collections: Vec<StoredCollection>,
+    pub parsed_items: Vec<StoredItem>,
+    pub issues: Vec<StorageAuditIssue>,
+}
+
+impl StorageAudit {
+    pub fn parsed_item_count(&self) -> usize {
+        self.parsed_items.len()
+    }
+
+    pub fn raw_entry_count(&self) -> usize {
+        self.raw_collection_dirs + self.raw_item_files
+    }
+
+    pub fn is_legitimate_empty(&self) -> bool {
+        self.raw_entry_count() == 0 && self.issues.is_empty()
+    }
+
+    pub fn is_suspicious_empty(&self) -> bool {
+        self.parsed_items.is_empty() && (self.raw_entry_count() > 0 || !self.issues.is_empty())
+    }
 }
 
 impl StagedStorage {
@@ -143,9 +177,8 @@ impl StagedStorage {
             .map_err(|e| format!("Cannot list staging dir {}: {e}", self.path.display()))?;
 
         for entry in staged_entries {
-            let entry = entry.map_err(|e| {
-                format!("Cannot read staged entry in {}: {e}", self.path.display())
-            })?;
+            let entry = entry
+                .map_err(|e| format!("Cannot read staged entry in {}: {e}", self.path.display()))?;
             let staged_path = entry.path();
             let active_path = base.join(entry.file_name());
             if let Err(e) = std::fs::rename(&staged_path, &active_path) {
@@ -177,8 +210,12 @@ impl StagedStorage {
             }
         }
 
-        std::fs::remove_dir(&self.path)
-            .map_err(|e| format!("Cannot remove empty staging dir {}: {e}", self.path.display()))?;
+        std::fs::remove_dir(&self.path).map_err(|e| {
+            format!(
+                "Cannot remove empty staging dir {}: {e}",
+                self.path.display()
+            )
+        })?;
 
         let previous_base = if moved_existing.is_empty() {
             let _ = std::fs::remove_dir(&backup);
@@ -211,7 +248,10 @@ impl ActivatedStorage {
                 .map_err(|e| format!("Cannot list active storage {}: {e}", base.display()))?
             {
                 let entry = entry.map_err(|e| {
-                    format!("Cannot read active storage entry in {}: {e}", base.display())
+                    format!(
+                        "Cannot read active storage entry in {}: {e}",
+                        base.display()
+                    )
                 })?;
                 let path = entry.path();
                 if self.previous_base.as_ref() == Some(&path) || is_internal_storage_dir(&path) {
@@ -254,56 +294,150 @@ impl ActivatedStorage {
     }
 }
 
-/// Load all collections from disk.  Missing or unreadable entries are skipped.
-pub fn load_collections() -> Vec<StoredCollection> {
+pub fn audit_storage() -> StorageAudit {
     let base = base_dir();
-    if !base.exists() {
-        return Vec::new();
-    }
-    let mut cols = Vec::new();
-    let entries = match std::fs::read_dir(&base) {
-        Ok(e) => e,
-        Err(_) => return cols,
+    let mut audit = StorageAudit {
+        base_dir: base.clone(),
+        raw_collection_dirs: 0,
+        raw_item_files: 0,
+        parsed_collections: Vec::new(),
+        parsed_items: Vec::new(),
+        issues: Vec::new(),
     };
-    for entry in entries.flatten() {
-        if is_internal_storage_dir(&entry.path()) {
-            continue;
-        }
-        let col_json = entry.path().join("collection.json");
-        if let Ok(data) = std::fs::read(&col_json) {
-            if let Ok(col) = serde_json::from_slice::<StoredCollection>(&data) {
-                cols.push(col);
-            }
-        }
-    }
-    cols
-}
 
-/// Load all items belonging to a collection.
-pub fn load_items(collection_id: &str) -> Vec<StoredItem> {
-    let dir = base_dir().join(collection_id);
-    if !dir.exists() {
-        return Vec::new();
+    if !base.exists() {
+        return audit;
     }
-    let mut items = Vec::new();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return items,
+
+    let entries = match std::fs::read_dir(&base) {
+        Ok(entries) => entries,
+        Err(e) => {
+            audit.issues.push(StorageAuditIssue {
+                path: base,
+                message: format!("Cannot list storage directory: {e}"),
+            });
+            return audit;
+        }
     };
-    for entry in entries.flatten() {
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                audit.issues.push(StorageAuditIssue {
+                    path: base.clone(),
+                    message: format!("Cannot read storage directory entry: {e}"),
+                });
+                continue;
+            }
+        };
         let path = entry.path();
-        if path.file_name().and_then(|n| n.to_str()) == Some("collection.json") {
+        if is_internal_storage_dir(&path) {
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            if let Ok(data) = std::fs::read(&path) {
-                if let Ok(item) = serde_json::from_slice::<StoredItem>(&data) {
-                    items.push(item);
+        if !path.is_dir() {
+            audit.issues.push(StorageAuditIssue {
+                path,
+                message: "Unexpected non-directory entry in MyKey secrets storage".to_string(),
+            });
+            continue;
+        }
+
+        audit.raw_collection_dirs += 1;
+
+        let col_json = path.join("collection.json");
+        let collection = match std::fs::read(&col_json) {
+            Ok(data) => match serde_json::from_slice::<StoredCollection>(&data) {
+                Ok(collection) => collection,
+                Err(e) => {
+                    audit.issues.push(StorageAuditIssue {
+                        path: col_json,
+                        message: format!("Cannot parse collection metadata: {e}"),
+                    });
+                    continue;
+                }
+            },
+            Err(e) => {
+                audit.issues.push(StorageAuditIssue {
+                    path: col_json,
+                    message: format!("Cannot read collection metadata: {e}"),
+                });
+                continue;
+            }
+        };
+
+        let collection_id = collection.id.clone();
+        audit.parsed_collections.push(collection);
+
+        let item_entries = match std::fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(e) => {
+                audit.issues.push(StorageAuditIssue {
+                    path,
+                    message: format!("Cannot list collection directory: {e}"),
+                });
+                continue;
+            }
+        };
+
+        for item_entry in item_entries {
+            let item_entry = match item_entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    audit.issues.push(StorageAuditIssue {
+                        path: path.clone(),
+                        message: format!("Cannot read collection directory entry: {e}"),
+                    });
+                    continue;
+                }
+            };
+            let item_path = item_entry.path();
+            if item_path.file_name().and_then(|n| n.to_str()) == Some("collection.json") {
+                continue;
+            }
+            if item_path.extension().and_then(|e| e.to_str()) != Some("json") {
+                audit.issues.push(StorageAuditIssue {
+                    path: item_path,
+                    message: "Unexpected non-JSON entry in collection directory".to_string(),
+                });
+                continue;
+            }
+
+            audit.raw_item_files += 1;
+
+            match std::fs::read(&item_path) {
+                Ok(data) => match serde_json::from_slice::<StoredItem>(&data) {
+                    Ok(item) => {
+                        if item.collection_id != collection_id {
+                            audit.issues.push(StorageAuditIssue {
+                                path: item_path,
+                                message: format!(
+                                    "Item collection_id '{}' does not match directory collection_id '{}'",
+                                    item.collection_id, collection_id
+                                ),
+                            });
+                        } else {
+                            audit.parsed_items.push(item);
+                        }
+                    }
+                    Err(e) => {
+                        audit.issues.push(StorageAuditIssue {
+                            path: item_path,
+                            message: format!("Cannot parse item: {e}"),
+                        });
+                    }
+                },
+                Err(e) => {
+                    audit.issues.push(StorageAuditIssue {
+                        path: item_path,
+                        message: format!("Cannot read item: {e}"),
+                    });
                 }
             }
         }
     }
-    items
+
+    audit
 }
 
 pub fn base_dir() -> PathBuf {

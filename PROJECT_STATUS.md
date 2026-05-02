@@ -1,6 +1,6 @@
 # MyKey Project Status
 
-Last updated: 2026-04-24
+Last updated: 2026-05-02
 
 ## Purpose
 - Canonical running project status and to-do document for MyKey release hardening.
@@ -12,9 +12,9 @@ Last updated: 2026-04-24
 ## Current Status
 - `mykey-migrate`
   - gnome-keyring unenroll/restore path is working and was live-tested successfully.
-  - KWallet readiness handling is improved and now stops at the correct wallet-readiness boundary.
-  - KeePassXC readiness handling is improved and now stops with explicit setup guidance.
-  - enroll path has already been hardened.
+  - KWallet enroll and unenroll paths are live-validated with provider-specific wallet readiness handling.
+  - KeePassXC enroll and unenroll paths are live-validated with provider-specific group readiness, item unlock, and metadata-only verification fallback when KeePassXC refuses post-restore secret reads.
+  - enroll path has merge-safe staging and no longer replaces existing MyKey storage with a provider read.
   - enroll now unlocks source collections before bulk secret reads, so locked source keyrings fail with a prompt instead of partial-read errors.
   - enroll staging now activates inside the writable per-user MyKey secrets store instead of requiring writes to `/etc/mykey`.
 - `mykey-pin`
@@ -319,6 +319,7 @@ Last updated: 2026-04-24
    - enroll should be safe against accidental second runs when MyKey already owns `org.freedesktop.secrets`
    - define teardown as an explicit MyKey action, not ordinary package removal
    - ordinary package uninstall should preserve `/etc/mykey` state; sensitive cleanup should require successful unenroll or an explicit purge path
+   - after the first release, align the migration CLI with the rest of MyKey around `mykey-migrate enroll|unenroll` and `mykey migrate ...` instead of the current `--enroll` / `--unenroll` flags
 
 ---
 
@@ -811,3 +812,20 @@ Grouped by day, oldest first.
 - Tightened PAM-facing lockout UX so the lockout-triggering PIN failure now reports the active cooldown immediately, and locked-PIN retries inside the same PAM conversation no longer spam the same lockout message on every retry.
 - Clarified `mykey-pin reset` so operators are told that biometric and security-key stages tied to the old PIN must be reconfigured after a new PIN is set.
 - Hardened the Arch package path by moving daemon finalization into post-transaction hooks, regenerating `trusted-binaries.json` from the final installed daemon binary, and shifting TPM access onto the daemon service unit through `SupplementaryGroups=tss`.
+- Live-validated the hardened Arch package path from a fresh install and trimmed the package post-install message down to the minimal auth-first next steps.
+- Smoothed `mykey-migrate --enroll` startup by auto-waiting for `mykey-secrets` to claim `org.freedesktop.secrets` before falling back to the manual recovery prompt.
+- Added guided KWallet destination-readiness retry during `mykey-migrate --unenroll` so restore can wait for an unlocked/exported wallet instead of immediately fataling on the first check.
+- Split `mykey-migrate --unenroll` more explicitly by provider path, preserving the working gnome-keyring restore flow while adding KWallet-specific wallet-creation guidance and post-restore handling.
+
+### 2026-05-01
+- Started the migration transaction-safety hardening pass by adding direct MyKey storage auditing for parsed collections/items, raw storage entries, and parse/read issues.
+- Changed `mykey-migrate --enroll` from replace semantics to merge semantics so provider reads are added to existing MyKey storage instead of replacing the whole store.
+- Guarded enroll against suspicious MyKey storage states and stopped offering old-keychain deletion when a transaction copied no new provider secrets.
+- Wired `mykey-migrate --unenroll` to audit MyKey storage before provider handoff, fail closed on suspicious storage, and reuse the audited source set for restore planning.
+- Made unenroll provider verification and finalization fail before MyKey cleanup when destination listing, restore verification, or provider finalization fails.
+- Added persistent `mykey-migrate` event logging under the user's MyKey state directory for source/destination providers, audit counts, merge counts, restore verification, cleanup, rollback, and fatal decisions.
+
+### 2026-05-02
+- Live-validated gnome-keyring, KWallet, and KeePassXC migration handoff paths after transaction-safety hardening.
+- Added KeePassXC-specific Secret Service handling: skip destructive write probes, wait for exposed database groups, unlock individual source items before `GetSecret`, and verify restore by expected metadata when KeePassXC exposes restored items but refuses post-restore value reads.
+- Added non-secret KeePassXC inventory logging for collection paths, item paths, labels, locked state, content type, exposed attribute keys, and secret-read availability to make future failures diagnosable.

@@ -19,8 +19,25 @@ pub fn user_data_root() -> PathBuf {
     PathBuf::from(".mykey")
 }
 
+pub fn user_state_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("MYKEY_STATE_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = std::env::var_os("XDG_STATE_HOME") {
+        return PathBuf::from(path).join(APP_DIR);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".local/state").join(APP_DIR);
+    }
+    user_data_root()
+}
+
 pub fn secrets_dir() -> PathBuf {
     user_data_root().join("secrets")
+}
+
+pub fn migrate_log_path() -> PathBuf {
+    user_state_root().join("migrate.log")
 }
 
 pub fn provider_dir() -> PathBuf {

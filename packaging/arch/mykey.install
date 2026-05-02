@@ -2,50 +2,22 @@ post_install() {
   cat <<EOF
 Installation complete.
 
-MyKey's post-transaction hook will now:
-  - refresh /etc/mykey/trusted-binaries.json from the final installed daemon binary
-  - reload systemd state
-  - enable and start mykey-daemon
-
 Recommended next steps:
-  1. See the top-level control surface:
-     mykey --help
+    1. Run the unified auth setup:
+       sudo mykey-auth setup
 
-  2. Run the unified auth setup:
-     sudo mykey-auth setup
+    2. Optionally enroll MyKey as your Secret Service provider:
+       mykey-migrate --enroll
 
-  3. Optionally enroll MyKey as your Secret Service provider:
-     mykey-migrate --enroll
-     Do not manually enable mykey-secrets first on initial setup.
-     The migration flow owns provider handoff and will enable/start
-     mykey-secrets only after the old provider has been copied and stopped.
+       Do not manually enable mykey-secrets first on initial setup.
+       The migration flow will enable/start the service after
+       proper provider handoff.
 
-  4. Optionally enable the tray:
-     mykey tray enable
+    3. Optionally enable the tray:
+       mykey tray enable
 
-Useful status checks:
-  - mykey status
-  - mykey tray status
-  - mykey pin status
-  - sudo systemctl status mykey-daemon
-  - systemctl --user status mykey-secrets
-  - journalctl -u mykey-daemon
-
-Notes:
-  - This package is an initial Arch scaffold.
-  - User Secret Service state now lives under your MyKey user data dir
-    (typically ~/.local/share/mykey/).
-  - Package removal preserves /etc/mykey state on purpose.
-  - Package removal also preserves your per-user MyKey Secret Service data.
-  - Use mykey-migrate --unenroll before uninstall if MyKey still owns
-    your Secret Service data path.
-  - Use sudo mykey disable before uninstall for a clean PAM teardown.
-    This will also walk through MyKey login teardown.
-    If you remove the package without doing that first, the managed PAM line
-    is still designed to fall through because it uses -auth and ignores a
-    missing pam_mykey module file.
-  - The current polkit, daemon logging, and Secret Service D-Bus policy
-    surfaces are still being tightened.
+    4. For help use:
+       mykey --help
 EOF
 }
 

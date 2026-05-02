@@ -18,8 +18,8 @@ impl DaemonClient {
         let pid = std::process::id();
         info!("[daemon_client] Connecting to com.mykey.Daemon (pid={pid})");
 
-        let conn = Connection::system()
-            .map_err(|e| format!("D-Bus system connection failed: {e}"))?;
+        let conn =
+            Connection::system().map_err(|e| format!("D-Bus system connection failed: {e}"))?;
 
         // Scope the proxy so it is dropped before `conn` is moved into the struct.
         {
